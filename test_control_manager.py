@@ -1,6 +1,6 @@
 import time
 from types import SimpleNamespace
-from control_manager import ControlManager
+from control_manager import ControlManager, _clamp
 from config import RC_RELEASE
 
 
