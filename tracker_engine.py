@@ -90,8 +90,9 @@ class TrackerEngine:
         self._state         = TrackerState.IDLE
         self._ramp_start    = 0.0
         self._ramp_progress = 0.0
-        self._throttle_ramp = 0.0   # отдельная рампа для throttle
-        self._throttle_ramp_start = 0.0
+        self._throttle_ramp = 0.0
+        self._throttle_ramp_start  = 0.0
+        self._dead_reckon_start    = 0.0   # момент когда цель была потеряна (DEAD_RECKON таймер)
 
     @property
     def state(self) -> TrackerState:
@@ -102,10 +103,11 @@ class TrackerEngine:
         self._vision.reset()
         self._pid_yaw.reset()
         self._pid_alt.reset()
-        self._ramp_start    = time.monotonic()
-        self._ramp_progress = 0.0
-        self._throttle_ramp = 0.0
-        self._throttle_ramp_start = time.monotonic()
+        self._ramp_start           = time.monotonic()
+        self._ramp_progress        = 0.0
+        self._throttle_ramp        = 0.0
+        self._throttle_ramp_start  = time.monotonic()
+        self._dead_reckon_start    = 0.0   # сбросить — будет установлен при потере цели
         self._state = TrackerState.ACQUIRING
         logger.info("TrackerEngine: ENGAGE → ACQUIRING")
 
@@ -114,8 +116,9 @@ class TrackerEngine:
         self._vision.reset()
         self._pid_yaw.reset()
         self._pid_alt.reset()
-        self._ramp_progress = 0.0
-        self._throttle_ramp = 0.0
+        self._ramp_progress     = 0.0
+        self._throttle_ramp     = 0.0
+        self._dead_reckon_start = 0.0
         self._state = TrackerState.IDLE
         logger.info("TrackerEngine: DISENGAGE → IDLE")
 
@@ -212,25 +215,47 @@ class TrackerEngine:
         )
 
     def _handle_lost(self) -> TrackResult:
-        """Обработка потери цели — dead reckoning → LOST."""
-        if self._state in (TrackerState.TRACKING, TrackerState.STRIKING,
-                           TrackerState.DEAD_RECKON):
+        """
+        Обработка потери цели.
+
+        Переходы:
+          TRACKING / STRIKING → DEAD_RECKON  (фиксируем _dead_reckon_start)
+          DEAD_RECKON          → LOST         (через DEAD_RECKONING_SEC от потери)
+          ACQUIRING            → LOST         (через RAMP_DURATION_SEC+DEAD_RECKONING_SEC от engage)
+
+        КРИТИЧНО — RC значения при DEAD_RECKON:
+          Возвращаем RC_MID (1500), НЕ RC_RELEASE (65535).
+          RC_RELEASE = UINT16_MAX = ArduPilot игнорирует поле → старый override остаётся
+          активным. Если дрон пикировал (PITCH_DIVE=1280), он продолжит пикировать!
+          RC_MID = нейтраль: горизонтальный полёт, hover throttle, нет вращения.
+        """
+        now = time.monotonic()
+
+        if self._state in (TrackerState.TRACKING, TrackerState.STRIKING):
+            # Первый кадр потери — фиксируем момент и переходим в DEAD_RECKON
+            self._dead_reckon_start = now
             self._state = TrackerState.DEAD_RECKON
-            # Dead reckoning: удерживаем последние RC значения
-            # VisionTracker уже возвращает Kalman predict на DEAD_RECKONING_SEC
-            # Если vision_result=None после DEAD_RECKONING_SEC → LOST
-            logger.debug("TrackerEngine: DEAD_RECKON")
+            logger.debug("TrackerEngine: → DEAD_RECKON (таймер старт)")
 
-        elapsed = time.monotonic() - self._ramp_start
-        if elapsed > RAMP_DURATION_SEC + DEAD_RECKONING_SEC:
-            self._state = TrackerState.LOST
-            logger.warning("TrackerEngine: LOST — цель потеряна окончательно")
+        elif self._state == TrackerState.DEAD_RECKON:
+            # Проверяем не истёк ли таймер (отсчитывается от момента потери цели)
+            if (now - self._dead_reckon_start) >= DEAD_RECKONING_SEC:
+                self._state = TrackerState.LOST
+                logger.warning("TrackerEngine: DEAD_RECKON → LOST (таймер истёк)")
 
+        elif self._state == TrackerState.ACQUIRING:
+            # Начальный поиск цели — даём RAMP_DURATION_SEC + DEAD_RECKONING_SEC
+            if (now - self._ramp_start) > RAMP_DURATION_SEC + DEAD_RECKONING_SEC:
+                self._state = TrackerState.LOST
+                logger.warning("TrackerEngine: ACQUIRING timeout → LOST")
+
+        # RC_MID для pitch/throttle/yaw — безопасная нейтральная позиция.
+        # RC_RELEASE (65535) для roll — оператор управляет креном.
         return TrackResult(
             state         = self._state,
             ramp_progress = self._ramp_progress,
-            rc_roll       = RC_RELEASE,
-            rc_pitch      = RC_RELEASE,
-            rc_throttle   = RC_RELEASE,
-            rc_yaw        = RC_RELEASE,
+            rc_roll       = RC_RELEASE,   # оператор управляет креном
+            rc_pitch      = RC_MID,       # нейтральный pitch — стоп пикирование
+            rc_throttle   = RC_MID,       # hover throttle
+            rc_yaw        = RC_MID,       # нейтральное рыскание
         )

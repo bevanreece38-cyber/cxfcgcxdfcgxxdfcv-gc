@@ -186,8 +186,16 @@ class InterceptorApp:
         # PixEagle-стиль: трекинг (YOLO + CSRT + Kalman + PID)
         self.tracker = TrackerEngine()
 
-        # NPU (RK3588 — все 3 ядра)
-        self.npu = NPUHandler(MODEL_PATH)
+        # NPU (RK3588 — все 3 ядра).
+        # Graceful degradation: без YOLO дрон работает только с CSRT (Kalman dead reckoning).
+        try:
+            self.npu = NPUHandler(MODEL_PATH)
+        except Exception as e:
+            logger.critical(
+                f"NPU недоступен ({e}). YOLO детекция отключена. "
+                f"Только CSRT трекинг (требует ручную наводку оператором)."
+            )
+            self.npu = None
 
         # Видеозахват (GStreamer MJPEG pipeline, низкая задержка)
         logger.info("Starting video capture (GStreamer MJPEG)...")
@@ -436,7 +444,11 @@ class InterceptorApp:
     #  ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ
     # ================================================================
     def _run_inference(self, frame: np.ndarray):
-        """NPU YOLO инференс. Возвращает post_process() результат или None."""
+        """NPU YOLO инференс. Возвращает post_process() результат или None.
+        Возвращает None если NPU не инициализирован (graceful degradation).
+        """
+        if self.npu is None:
+            return None   # NPU недоступен — CSRT трекинг без YOLO
         img = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         raw = self.npu.inference(rgb)
