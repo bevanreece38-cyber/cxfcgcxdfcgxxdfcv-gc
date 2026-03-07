@@ -5,17 +5,19 @@ TrackerEngine — алгоритм перехвата цели (PixEagle арх�
   Горизонталь:  цель справа → yaw вправо, цель слева → yaw влево
   Вертикаль:    цель выше → throttle вверх, цель ниже → throttle вниз + pitch
   Диагонали:    любая комбинация (дрон выходит на траекторию перехвата)
-  Позади выше:  yaw разворот + throttle вверх
-  Позади ниже:  yaw разворот + pitch пикирование
+  Позади выше:  yaw разворот + throttle вверх + roll assist
+  Позади ниже:  yaw разворот + pitch пикирование + roll assist
 
 Плавное ускорение:
   - Throttle нарастает через THROTTLE_RAMP_SEC (нет рывков)
   - Pitch нарастает через RAMP_DURATION_SEC
-  - Dead reckoning при потере цели до 0.4 сек
+  - STRIKING: throttle до RC_THROTTLE_STRIKING (1800) для максимального ускорения
+  - Roll assist: при |err_x| > ROLL_ASSIST_THRESHOLD → крен для быстрого разворота
 
 State машина:
   IDLE → engage() → ACQUIRING → (детекция) → TRACKING
-  TRACKING → (потеря <0.25с) → DEAD_RECKON → (потеря >0.25с) → LOST
+  TRACKING → (потеря <0.25с) → DEAD_RECKON → REACQUIRE → LOST
+  REACQUIRE: манёвр по Kalman vx,vy пока цель не найдена или таймаут
   TRACKING → (рампа 100%) → STRIKING
   LOST / disengage() → IDLE
 """
@@ -24,15 +26,17 @@ import time
 import logging
 import numpy as np
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 from config import (
     FRAME_WIDTH, FRAME_HEIGHT,
     RC_MID, RC_RELEASE, RC_SAFE_MIN, RC_SAFE_MAX,
-    RC_THROTTLE_MIN, RC_THROTTLE_MAX,
+    RC_THROTTLE_MIN, RC_THROTTLE_MAX, RC_THROTTLE_STRIKING,
+    ROLL_ASSIST_THRESHOLD, ROLL_ASSIST_MIN, ROLL_ASSIST_MAX,
     PITCH_NEAR, PITCH_DIVE,
     RAMP_DURATION_SEC, THROTTLE_RAMP_SEC,
-    DEAD_RECKONING_SEC,
+    DEAD_RECKONING_SEC, REACQUIRE_TIMEOUT,
+    MAX_FPS,
     KP_YAW, KI_YAW, KD_YAW,
     KP_ALT, KI_ALT, KD_ALT,
     TARGET_CLASS_ID, CONF_THRESHOLD,
@@ -91,8 +95,11 @@ class TrackerEngine:
         self._ramp_start    = 0.0
         self._ramp_progress = 0.0
         self._throttle_ramp = 0.0
-        self._throttle_ramp_start  = 0.0
-        self._dead_reckon_start    = 0.0   # момент когда цель была потеряна (DEAD_RECKON таймер)
+        self._throttle_ramp_start = 0.0
+        self._dead_reckon_start   = 0.0   # момент потери цели (DEAD_RECKON таймер)
+        self._reacquire_start     = 0.0   # момент входа в REACQUIRE
+        self._reacquire_pos: Tuple[float, float] = (0.0, 0.0)  # последняя известная позиция
+        self._reacquire_vel: Tuple[float, float] = (0.0, 0.0)  # Kalman velocity при потере
 
     @property
     def state(self) -> TrackerState:
@@ -103,11 +110,14 @@ class TrackerEngine:
         self._vision.reset()
         self._pid_yaw.reset()
         self._pid_alt.reset()
-        self._ramp_start           = time.monotonic()
-        self._ramp_progress        = 0.0
-        self._throttle_ramp        = 0.0
-        self._throttle_ramp_start  = time.monotonic()
-        self._dead_reckon_start    = 0.0   # сбросить — будет установлен при потере цели
+        self._ramp_start          = time.monotonic()
+        self._ramp_progress       = 0.0
+        self._throttle_ramp       = 0.0
+        self._throttle_ramp_start = time.monotonic()
+        self._dead_reckon_start   = 0.0
+        self._reacquire_start     = 0.0
+        self._reacquire_pos       = (0.0, 0.0)
+        self._reacquire_vel       = (0.0, 0.0)
         self._state = TrackerState.ACQUIRING
         logger.info("TrackerEngine: ENGAGE → ACQUIRING")
 
@@ -119,8 +129,29 @@ class TrackerEngine:
         self._ramp_progress     = 0.0
         self._throttle_ramp     = 0.0
         self._dead_reckon_start = 0.0
+        self._reacquire_start   = 0.0
         self._state = TrackerState.IDLE
         logger.info("TrackerEngine: DISENGAGE → IDLE")
+
+    def _compute_roll_assist(self, err_x: float) -> int:
+        """
+        Roll assist для быстрого горизонтального разворота.
+
+        Включается только когда |err_x| > ROLL_ASSIST_THRESHOLD (150 px).
+        Линейно нарастает от RC_MID до ROLL_ASSIST_MAX/MIN.
+        При err_x в диапазоне [-threshold, +threshold] → RC_RELEASE (оператор управляет).
+
+        err_x > 0 → цель справа → крен вправо  (rc_roll > RC_MID)
+        err_x < 0 → цель слева  → крен влево   (rc_roll < RC_MID)
+        """
+        if abs(err_x) <= ROLL_ASSIST_THRESHOLD:
+            return RC_RELEASE
+        max_range = max(FRAME_WIDTH / 2.0 - ROLL_ASSIST_THRESHOLD, 1.0)
+        factor = min((abs(err_x) - ROLL_ASSIST_THRESHOLD) / max_range, 1.0)
+        if err_x > 0:
+            return int(RC_MID + (ROLL_ASSIST_MAX - RC_MID) * factor)
+        else:
+            return int(RC_MID - (RC_MID - ROLL_ASSIST_MIN) * factor)
 
     def step(self, yolo_outputs, frame: np.ndarray) -> TrackResult:
         """
@@ -128,7 +159,7 @@ class TrackerEngine:
 
         Args:
             yolo_outputs: результат YOLO post_process() или None
-            frame:        BGR кадр (640×480) для CSRT
+            frame:        BGR кадр (640×480) для CSRT/KCF
 
         Returns:
             TrackResult с RC значениями для ControlManager
@@ -136,8 +167,8 @@ class TrackerEngine:
         if self._state == TrackerState.IDLE:
             return _idle_result()
 
-        # VisionTracker: YOLO + CSRT + Kalman
-        # ИСПРАВЛЕНО: frame — первый аргумент
+        # VisionTracker: YOLO + CSRT/KCF + Kalman
+        # frame — первый аргумент
         vision_result = self._vision.step(frame, yolo_outputs)
 
         if vision_result is None:
@@ -174,28 +205,28 @@ class TrackerEngine:
         # err_y > 0 = цель ниже центра = нужно снижаться
         # err_y < 0 = цель выше центра = нужно подниматься
         raw_throttle_delta = -self._pid_alt.update(err_y)
-        # Плавное нарастание throttle через рампу
         throttle_delta = raw_throttle_delta * self._throttle_ramp
-        raw_throttle = RC_MID + throttle_delta
-        rc_throttle = int(np.clip(raw_throttle, RC_THROTTLE_MIN, RC_THROTTLE_MAX))
+        raw_throttle   = RC_MID + throttle_delta
 
         # --- C. PITCH — кинетический удар (рампа пикирования) ---
-        # Нормированная Y позиция цели (0 = верх кадра, 1 = низ кадра)
         norm_y = float(np.clip(cy / FRAME_HEIGHT, 0.0, 1.0))
-        # Целевой питч в зависимости от вертикальной позиции цели
         target_pitch = PITCH_NEAR - (PITCH_NEAR - PITCH_DIVE) * norm_y
-        # Нарастание от нейтрали (RC_MID=1500) до target_pitch через рампу
         rc_pitch_raw = RC_MID - (RC_MID - target_pitch) * self._ramp_progress
         rc_pitch = int(np.clip(rc_pitch_raw, PITCH_DIVE, PITCH_NEAR))
 
-        # --- D. ROLL — всегда passthrough (оператор управляет креном) ---
-        rc_roll = RC_RELEASE
+        # --- D. ROLL — assist для быстрого разворота при большом err_x ---
+        # При |err_x| <= ROLL_ASSIST_THRESHOLD → RC_RELEASE (оператор управляет)
+        # При |err_x|  > ROLL_ASSIST_THRESHOLD → пропорциональный крен
+        rc_roll = self._compute_roll_assist(err_x)
 
-        # --- Состояние ---
+        # --- Состояние + throttle cap ---
         if self._ramp_progress >= 1.0:
             self._state = TrackerState.STRIKING
+            # Максимальное ускорение при финальном ударе
+            rc_throttle = int(np.clip(raw_throttle, RC_THROTTLE_MIN, RC_THROTTLE_STRIKING))
         else:
             self._state = TrackerState.TRACKING
+            rc_throttle = int(np.clip(raw_throttle, RC_THROTTLE_MIN, RC_THROTTLE_MAX))
 
         return TrackResult(
             state         = self._state,
@@ -218,39 +249,85 @@ class TrackerEngine:
         """
         Обработка потери цели.
 
-        Переходы:
+        Цепочка переходов:
           TRACKING / STRIKING → DEAD_RECKON  (фиксируем _dead_reckon_start)
-          DEAD_RECKON          → LOST         (через DEAD_RECKONING_SEC от потери)
-          ACQUIRING            → LOST         (через RAMP_DURATION_SEC+DEAD_RECKONING_SEC от engage)
+          DEAD_RECKON          → REACQUIRE   (через DEAD_RECKONING_SEC)
+          REACQUIRE            → LOST        (через REACQUIRE_TIMEOUT)
+          ACQUIRING            → LOST        (через RAMP_DURATION_SEC+DEAD_RECKONING_SEC)
 
-        КРИТИЧНО — RC значения при DEAD_RECKON:
-          Возвращаем RC_MID (1500), НЕ RC_RELEASE (65535).
-          RC_RELEASE = UINT16_MAX = ArduPilot игнорирует поле → старый override остаётся
-          активным. Если дрон пикировал (PITCH_DIVE=1280), он продолжит пикировать!
-          RC_MID = нейтраль: горизонтальный полёт, hover throttle, нет вращения.
+        REACQUIRE — продолжение манёвра по последнему вектору Kalman vx,vy:
+          Дрон продолжает лететь в направлении последней скорости цели,
+          применяя yaw и roll-assist, пока цель не будет найдена снова.
+
+        КРИТИЧНО — RC значения при DEAD_RECKON / REACQUIRE:
+          RC_MID (1500) для pitch/throttle, НЕ RC_RELEASE (65535).
+          RC_RELEASE = UINT16_MAX = ArduPilot игнорирует поле → старый override
+          (PITCH_DIVE=1280) остаётся активным → дрон продолжает пикировать!
         """
         now = time.monotonic()
 
+        # TRACKING / STRIKING → DEAD_RECKON
         if self._state in (TrackerState.TRACKING, TrackerState.STRIKING):
-            # Первый кадр потери — фиксируем момент и переходим в DEAD_RECKON
             self._dead_reckon_start = now
             self._state = TrackerState.DEAD_RECKON
             logger.debug("TrackerEngine: → DEAD_RECKON (таймер старт)")
 
+        # DEAD_RECKON → REACQUIRE (после DEAD_RECKONING_SEC)
         elif self._state == TrackerState.DEAD_RECKON:
-            # Проверяем не истёк ли таймер (отсчитывается от момента потери цели)
             if (now - self._dead_reckon_start) >= DEAD_RECKONING_SEC:
-                self._state = TrackerState.LOST
-                logger.warning("TrackerEngine: DEAD_RECKON → LOST (таймер истёк)")
+                vx, vy = self._vision.get_velocity()
+                lx, ly = self._vision.get_lead_point()
+                self._reacquire_start = now
+                self._reacquire_pos   = (lx, ly)
+                self._reacquire_vel   = (vx, vy)
+                self._state = TrackerState.REACQUIRE
+                logger.info("TrackerEngine: DEAD_RECKON → REACQUIRE "
+                            f"(vx={vx:.1f} vy={vy:.1f} px/frame)")
 
+        # ACQUIRING timeout → LOST
         elif self._state == TrackerState.ACQUIRING:
-            # Начальный поиск цели — даём RAMP_DURATION_SEC + DEAD_RECKONING_SEC
             if (now - self._ramp_start) > RAMP_DURATION_SEC + DEAD_RECKONING_SEC:
                 self._state = TrackerState.LOST
                 logger.warning("TrackerEngine: ACQUIRING timeout → LOST")
 
-        # RC_MID для pitch/throttle/yaw — безопасная нейтральная позиция.
-        # RC_RELEASE (65535) для roll — оператор управляет креном.
+        # REACQUIRE: манёвр по Kalman velocity
+        if self._state == TrackerState.REACQUIRE:
+            elapsed = now - self._reacquire_start
+            if elapsed >= REACQUIRE_TIMEOUT:
+                self._state = TrackerState.LOST
+                logger.warning("TrackerEngine: REACQUIRE → LOST (таймер истёк)")
+            else:
+                # Экстраполяция позиции цели по последней скорости.
+                # frames_elapsed — приближение: предполагается постоянный MAX_FPS.
+                # При реальном FPS, отличном от MAX_FPS, погрешность пропорциональна
+                # разнице скоростей — допустимо в пределах REACQUIRE_TIMEOUT=1.5с.
+                frames_elapsed = elapsed * MAX_FPS
+                vx, vy         = self._reacquire_vel
+                pred_x = float(np.clip(
+                    self._reacquire_pos[0] + vx * frames_elapsed, 0.0, FRAME_WIDTH
+                ))
+                pred_y = float(np.clip(
+                    self._reacquire_pos[1] + vy * frames_elapsed, 0.0, FRAME_HEIGHT
+                ))
+                err_x = pred_x - FRAME_WIDTH  / 2.0
+                err_y = pred_y - FRAME_HEIGHT / 2.0
+                raw_yaw = RC_MID + self._pid_yaw.update(err_x)
+                rc_yaw  = int(np.clip(raw_yaw, RC_SAFE_MIN, RC_SAFE_MAX))
+                rc_roll = self._compute_roll_assist(err_x)
+                return TrackResult(
+                    state         = TrackerState.REACQUIRE,
+                    lead_x        = pred_x,
+                    lead_y        = pred_y,
+                    err_x         = err_x,
+                    err_y         = err_y,
+                    rc_roll       = rc_roll,
+                    rc_pitch      = RC_MID,
+                    rc_throttle   = RC_MID,
+                    rc_yaw        = rc_yaw,
+                    ramp_progress = self._ramp_progress,
+                )
+
+        # Безопасные нейтрали для DEAD_RECKON (в окне), ACQUIRING (в окне), LOST
         return TrackResult(
             state         = self._state,
             ramp_progress = self._ramp_progress,

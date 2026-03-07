@@ -137,3 +137,66 @@ def test_lead_point_calculation():
     assert 0 <= ly <= 480
     # При движении влево lead_x должна быть левее начальной позиции цели
     assert lx < initial_x
+
+def test_get_velocity_returns_tuple():
+    """get_velocity() возвращает (vx, vy) как два float."""
+    vt = VisionTracker()
+    vt.reset()
+    vx, vy = vt.get_velocity()
+    assert isinstance(vx, float)
+    assert isinstance(vy, float)
+
+
+def test_get_velocity_after_movement():
+    """После нескольких шагов с движущейся целью vx/vy ≠ 0."""
+    vt = VisionTracker()
+    vt.reset()
+    frame = _textured_frame()
+    # Цель движется влево по 10 пикселей за кадр
+    for x in (320, 310, 300, 290, 280):
+        vt.step(frame, _det(x, 240))
+    vx, vy = vt.get_velocity()
+    # Kalman должен оценить отрицательную скорость по X
+    assert vx < 0, f"Ожидался vx < 0 для цели движущейся влево, получен {vx}"
+
+
+def test_csrt_kcf_switch_using_kcf_flag():
+    """_using_kcf устанавливается в False по умолчанию и при reset."""
+    vt = VisionTracker()
+    assert vt._using_kcf is False
+    vt._using_kcf = True
+    vt.reset()
+    assert vt._using_kcf is False
+
+
+def test_maybe_switch_tracker_sets_kcf_at_high_speed(monkeypatch):
+    """При скорости > HIGH_SPEED_TRACKER_THRESHOLD → _using_kcf = True."""
+    from config import HIGH_SPEED_TRACKER_THRESHOLD
+    vt = VisionTracker()
+    vt.reset()
+    frame = _textured_frame()
+    # Инициализируем трекер YOLO детекцией
+    vt.step(frame, _det(320, 240))
+    assert vt._tracking
+
+    # Замокать get_velocity чтобы вернуть высокую скорость
+    monkeypatch.setattr(vt, 'get_velocity',
+                        lambda: (HIGH_SPEED_TRACKER_THRESHOLD + 10.0, 0.0))
+    # Вызвать напрямую
+    vt._maybe_switch_tracker(frame, (300, 220, 340, 260))
+    assert vt._using_kcf is True, "Ожидался переход на KCF при высокой скорости"
+
+
+def test_maybe_switch_tracker_reverts_to_csrt_at_low_speed(monkeypatch):
+    """После переключения на KCF, при низкой скорости → вернуться на CSRT."""
+    from config import LOW_SPEED_TRACKER_THRESHOLD
+    vt = VisionTracker()
+    vt.reset()
+    frame = _textured_frame()
+    vt.step(frame, _det(320, 240))
+    vt._using_kcf = True   # принудительно KCF
+
+    monkeypatch.setattr(vt, 'get_velocity',
+                        lambda: (LOW_SPEED_TRACKER_THRESHOLD - 10.0, 0.0))
+    vt._maybe_switch_tracker(frame, (300, 220, 340, 260))
+    assert vt._using_kcf is False, "Ожидался возврат на CSRT при низкой скорости"

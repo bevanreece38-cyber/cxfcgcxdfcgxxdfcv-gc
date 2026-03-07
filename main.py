@@ -330,6 +330,7 @@ class InterceptorApp:
 
         if result.state in (TrackerState.TRACKING,
                             TrackerState.DEAD_RECKON,
+                            TrackerState.REACQUIRE,
                             TrackerState.STRIKING):
             # Отправляем RC значения через ControlManager
             # rc_roll = RC_RELEASE = 65535 → Roll управляет оператор
@@ -399,6 +400,7 @@ class InterceptorApp:
             TrackerState.TRACKING:    (0, 0, 255),
             TrackerState.STRIKING:    (0, 0, 255),
             TrackerState.DEAD_RECKON: (0, 255, 255),
+            TrackerState.REACQUIRE:   (0, 165, 255),   # оранжевый
         }.get(r.state, (255, 255, 0))
 
         # Текущая позиция цели (рисуем только если координаты валидны)

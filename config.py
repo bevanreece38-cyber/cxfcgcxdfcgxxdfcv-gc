@@ -6,7 +6,7 @@
 #   Наш дрон:  ~150 км/ч = 41.7 м/с
 #   Цель:      160-180 км/ч = 44-50 м/с
 #   Сближение: до 320 км/ч = 89 м/с (лоб-в-лоб)
-#   Упреждение: LEAD_TIME_SEC = 0.12 сек = ~10 м при 89 м/с
+#   Упреждение: LEAD_TIME_SEC = 0.30 сек = ~27 м при 89 м/с
 # =====================================================
 
 # --- MAVLink / SpeedyBee F405 UART ---
@@ -17,8 +17,8 @@ HEARTBEAT_TIMEOUT   = 3.0
 CONNECT_RETRIES     = 5
 CONNECT_RETRY_DELAY = 2.0
 
-# --- NPU YOLO (RK3588 NPU) ---
-MODEL_PATH      = "drone_model.rknn"
+# --- NPU YOLO (RK3588 NPU) — YOLOv8n RKNN ---
+MODEL_PATH      = "drone_model.rknn"   # YOLOv8n экспортированный в .rknn формат
 FRAME_WIDTH     = 640
 FRAME_HEIGHT    = 480
 MAX_FPS         = 30
@@ -26,12 +26,17 @@ CONF_THRESHOLD  = 0.5
 NMS_THRESHOLD   = 0.45
 TARGET_CLASS_ID = 0
 
-# --- Двойное машинное зрение: YOLO + CSRT (PixEagle архитектура) ---
+# --- Двойное машинное зрение: YOLO + CSRT/KCF (PixEagle архитектура) ---
 # YOLO каждые N кадров: 30/2 = 15 детекций/сек на NPU
-# CSRT заполняет промежутки: 30 FPS трекинга на CPU
+# CSRT/KCF заполняет промежутки: 30 FPS трекинга на CPU
 YOLO_EVERY_N_FRAMES    = 2
-TRACKER_TYPE           = "CSRT"     # CSRT точнее KCF при быстрых целях
-TRACKER_REINIT_ON_YOLO = True       # переинициализация CSRT при каждой YOLO-детекции
+TRACKER_TYPE           = "CSRT"     # базовый трекер; KCF при высокой скорости цели
+TRACKER_REINIT_ON_YOLO = True       # переинициализация трекера при каждой YOLO-детекции
+
+# Переключение CSRT → KCF при высокой скорости (px/frame)
+# KCF быстрее при скорости >80 px/frame; CSRT точнее при низкой скорости
+HIGH_SPEED_TRACKER_THRESHOLD = 80.0   # px/frame → переключиться на KCF
+LOW_SPEED_TRACKER_THRESHOLD  = 50.0   # px/frame → вернуться на CSRT (гистерезис)
 
 # --- RC управление (ArduPilot AltHold MAVLink RC_CHANNELS_OVERRIDE) ---
 RC_MID     = 1500   # нейтральное положение стика
@@ -45,8 +50,15 @@ RC_SAFE_MIN = 1100
 RC_SAFE_MAX = 1900
 
 # Throttle в AltHold: 1500 = hover
-RC_THROTTLE_MIN = 1350  # мягкое снижение
-RC_THROTTLE_MAX = 1650  # мягкий подъём
+RC_THROTTLE_MIN      = 1350  # мягкое снижение
+RC_THROTTLE_MAX      = 1650  # мягкий подъём при TRACKING/DEAD_RECKON
+RC_THROTTLE_STRIKING = 1800  # максимальное ускорение при STRIKING (финальный удар)
+
+# Roll-assist: крен для быстрого разворота при большом горизонтальном отклонении
+# Включается при |err_x| > ROLL_ASSIST_THRESHOLD пикселей
+ROLL_ASSIST_THRESHOLD = 150   # px: порог включения (150 px ≈ 23% ширины кадра)
+ROLL_ASSIST_MIN       = 1350  # макс крен влево  (PWM)
+ROLL_ASSIST_MAX       = 1650  # макс крен вправо (PWM)
 
 # CH10 RadioMaster — канал атаки
 ATTACK_CHANNEL_MIN = 1800
@@ -57,13 +69,18 @@ ATTACK_CHANNEL_MAX = 2000
 KEEPALIVE_HZ = 25
 
 # --- Dead reckoning ---
-# 89 м/с * 0.4 сек = 35 м — допустимо для перехвата
+# 89 м/с * 0.25 сек = 22 м — допустимо для перехвата
 DEAD_RECKONING_SEC = 0.25
+
+# --- REACQUIRE: продолжение манёвра через Kalman vx,vy после DEAD_RECKON ---
+# Дрон продолжает лететь в последнем известном направлении цели
+# 89 м/с * 1.5 сек = 134 м — максимальная дальность REACQUIRE поиска
+REACQUIRE_TIMEOUT = 1.5   # сек
 
 # --- Predictive intercept (упреждение точки наводки) ---
 # Наводимся не на текущую позицию, а на прогнозную точку через LEAD_TIME_SEC
-# При скорости сближения 89 м/с за 0.12 сек = ~11 м упреждения
-LEAD_TIME_SEC = 0.12    # 120 мс
+# При скорости сближения 89 м/с за 0.30 сек = ~27 м упреждения (лобовой курс)
+LEAD_TIME_SEC = 0.30    # 300 мс — увеличено с 0.12 для встречного курса
 LEAD_FACTOR   = 2.5     # усилитель Kalman velocity (компенсация задержки pipeline)
 
 # --- Кинетический удар (Pitch рампа) ---
@@ -124,7 +141,7 @@ STREAM_HEIGHT  = 360
 # --- Захват видео ---
 VIDEO_SOURCE_INDEX  = 1
 VIDEO_DEVICE_PATH   = "/dev/video1"
-VIDEO_PIXEL_FORMAT  = "MJPEG"
+VIDEO_PIXEL_FORMAT  = "YUYV"          # YUYV для меньшей задержки (нет CPU декодинга MJPEG)
 VIDEO_USE_GSTREAMER = True
 
 # --- GStreamer H.264/RTP/UDP выход (QGroundControl / VLC) ---

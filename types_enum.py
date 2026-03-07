@@ -12,6 +12,7 @@ class TrackerState(Enum):
     ACQUIRING   = "ACQUIRING"
     TRACKING    = "TRACKING"
     DEAD_RECKON = "DEAD_RECKON"
+    REACQUIRE   = "REACQUIRE"    # продолжение манёвра по Kalman vx,vy после dead reckoning
     LOST        = "LOST"
     STRIKING    = "STRIKING"
 

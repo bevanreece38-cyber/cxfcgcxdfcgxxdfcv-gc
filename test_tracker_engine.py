@@ -21,11 +21,12 @@ from tracker_engine import TrackerEngine, TrackResult
 from types_enum import TrackerState
 from config import (
     RC_MID, RC_RELEASE,
-    DEAD_RECKONING_SEC, RAMP_DURATION_SEC, THROTTLE_RAMP_SEC,
+    DEAD_RECKONING_SEC, REACQUIRE_TIMEOUT, RAMP_DURATION_SEC, THROTTLE_RAMP_SEC,
     FRAME_WIDTH, FRAME_HEIGHT,
     RC_SAFE_MIN, RC_SAFE_MAX,
-    RC_THROTTLE_MIN, RC_THROTTLE_MAX,
+    RC_THROTTLE_MIN, RC_THROTTLE_MAX, RC_THROTTLE_STRIKING,
     PITCH_NEAR, PITCH_DIVE,
+    ROLL_ASSIST_THRESHOLD,
 )
 
 # ─── Хелперы ────────────────────────────────────────────────────────────────
@@ -49,6 +50,7 @@ def _eng(vision_seq):
 
     eng._vision.step            = _mock_step
     eng._vision.get_lead_point  = lambda: _LEAD
+    eng._vision.get_velocity    = lambda: (0.0, 0.0)
     eng._vision.reset           = lambda: None
     return eng
 
@@ -166,28 +168,28 @@ def test_dead_reckon_stays_in_dead_reckon_within_window():
     assert r2.state == TrackerState.DEAD_RECKON
 
 
-def test_dead_reckon_transitions_to_lost_after_timeout():
+def test_dead_reckon_transitions_to_reacquire_after_timeout():
     """
-    BUG FIX #2: DEAD_RECKON → LOST через DEAD_RECKONING_SEC от момента ПОТЕРИ.
-    Старый код: таймер от engage() — при долгом трекинге LOST мог никогда не приходить.
+    DEAD_RECKON → REACQUIRE через DEAD_RECKONING_SEC от момента потери.
+    (Не LOST напрямую — сначала REACQUIRE для манёвра по Kalman vx,vy.)
     """
     eng = _eng([_HIT] * 5 + [None] * 200)
     eng.engage()
     for _ in range(5):
         eng.step(_DET, _FRAME)
 
-    # Войти в DEAD_RECKON — запоминает реальный _dead_reckon_start
+    # Войти в DEAD_RECKON
     r_dr = eng.step(_DET, _FRAME)
     assert r_dr.state == TrackerState.DEAD_RECKON
 
-    # Промотать время вперёд за пределы DEAD_RECKONING_SEC
+    # Промотать за DEAD_RECKONING_SEC → должен перейти в REACQUIRE
     future = time.monotonic() + DEAD_RECKONING_SEC + 0.05
     with patch("tracker_engine.time") as mt:
         mt.monotonic.return_value = future
-        r_lost = eng.step(_DET, _FRAME)
-    assert r_lost.state == TrackerState.LOST, (
-        f"BUG: ожидался LOST через {DEAD_RECKONING_SEC}с dead reckoning, "
-        f"получен {r_lost.state}."
+        r_reacq = eng.step(_DET, _FRAME)
+    assert r_reacq.state == TrackerState.REACQUIRE, (
+        f"Ожидался REACQUIRE через {DEAD_RECKONING_SEC}с dead reckoning, "
+        f"получен {r_reacq.state}."
     )
 
 
@@ -449,3 +451,193 @@ def test_throttle_ramp_reaches_one():
         mt.monotonic.return_value = future
         r = eng.step(_DET, _FRAME)
     assert r.throttle_ramp == pytest.approx(1.0)
+
+
+# ─── 9. REACQUIRE state ──────────────────────────────────────────────────────
+
+def test_reacquire_transitions_to_lost_after_timeout():
+    """REACQUIRE → LOST через REACQUIRE_TIMEOUT."""
+    eng = _eng([_HIT] * 5 + [None] * 200)
+    eng.engage()
+    for _ in range(5):
+        eng.step(_DET, _FRAME)
+
+    # Enter DEAD_RECKON
+    r_dr = eng.step(_DET, _FRAME)
+    assert r_dr.state == TrackerState.DEAD_RECKON
+
+    # DEAD_RECKON → REACQUIRE
+    t_loss = time.monotonic()
+    future1 = t_loss + DEAD_RECKONING_SEC + 0.05
+    with patch("tracker_engine.time") as mt:
+        mt.monotonic.return_value = future1
+        r_reacq = eng.step(_DET, _FRAME)
+    assert r_reacq.state == TrackerState.REACQUIRE
+
+    # REACQUIRE → LOST
+    future2 = future1 + REACQUIRE_TIMEOUT + 0.05
+    with patch("tracker_engine.time") as mt:
+        mt.monotonic.return_value = future2
+        r_lost = eng.step(_DET, _FRAME)
+    assert r_lost.state == TrackerState.LOST, (
+        f"REACQUIRE должен истечь в LOST через {REACQUIRE_TIMEOUT}с, "
+        f"получен {r_lost.state}"
+    )
+
+
+def test_reacquire_returns_reacquire_state():
+    """REACQUIRE возвращает TrackResult с state=REACQUIRE (не LOST)."""
+    eng = _eng([_HIT] * 5 + [None] * 200)
+    eng.engage()
+    for _ in range(5):
+        eng.step(_DET, _FRAME)
+    eng.step(_DET, _FRAME)   # DEAD_RECKON
+
+    future = time.monotonic() + DEAD_RECKONING_SEC + 0.05
+    with patch("tracker_engine.time") as mt:
+        mt.monotonic.return_value = future
+        r = eng.step(_DET, _FRAME)
+    assert r.state == TrackerState.REACQUIRE
+
+
+def test_reacquire_rc_pitch_is_mid():
+    """При REACQUIRE rc_pitch = RC_MID (нет пикирования без подтверждения цели)."""
+    eng = _eng([_HIT] * 5 + [None] * 200)
+    eng.engage()
+    for _ in range(5):
+        eng.step(_DET, _FRAME)
+    eng.step(_DET, _FRAME)   # DEAD_RECKON
+
+    future = time.monotonic() + DEAD_RECKONING_SEC + 0.05
+    with patch("tracker_engine.time") as mt:
+        mt.monotonic.return_value = future
+        r = eng.step(_DET, _FRAME)
+    assert r.state == TrackerState.REACQUIRE
+    assert r.rc_pitch == RC_MID, (
+        f"SAFETY: rc_pitch={r.rc_pitch} при REACQUIRE. "
+        f"Должен быть RC_MID={RC_MID} — нет пикирования без визуального контакта."
+    )
+
+
+def test_reacquire_rc_throttle_is_mid():
+    """При REACQUIRE rc_throttle = RC_MID (hover)."""
+    eng = _eng([_HIT] * 5 + [None] * 200)
+    eng.engage()
+    for _ in range(5):
+        eng.step(_DET, _FRAME)
+    eng.step(_DET, _FRAME)   # DEAD_RECKON
+
+    future = time.monotonic() + DEAD_RECKONING_SEC + 0.05
+    with patch("tracker_engine.time") as mt:
+        mt.monotonic.return_value = future
+        r = eng.step(_DET, _FRAME)
+    assert r.state == TrackerState.REACQUIRE
+    assert r.rc_throttle == RC_MID
+
+
+def test_reacquire_recovery_to_tracking():
+    """Цель вернулась во время REACQUIRE → TRACKING."""
+    eng = _eng([_HIT] * 5 + [None] * 200)
+    eng.engage()
+    for _ in range(5):
+        eng.step(_DET, _FRAME)
+    eng.step(_DET, _FRAME)   # DEAD_RECKON
+
+    # Enter REACQUIRE
+    future = time.monotonic() + DEAD_RECKONING_SEC + 0.05
+    with patch("tracker_engine.time") as mt:
+        mt.monotonic.return_value = future
+        eng.step(_DET, _FRAME)
+
+    # Target returns — swap vision mock to return detection
+    eng._vision.step = lambda f, y: _HIT
+    with patch("tracker_engine.time") as mt:
+        mt.monotonic.return_value = future + 0.1
+        r = eng.step(_DET, _FRAME)
+    assert r.state in (TrackerState.TRACKING, TrackerState.STRIKING), (
+        f"Цель вернулась во время REACQUIRE: ожидался TRACKING, получен {r.state}"
+    )
+
+
+# ─── 10. Roll assist ─────────────────────────────────────────────────────────
+
+def test_roll_assist_applied_when_target_far_right():
+    """При err_x > ROLL_ASSIST_THRESHOLD → rc_roll > RC_MID (крен вправо)."""
+    # Поместить цель далеко справа: cx = FRAME_WIDTH * 0.9 = 576
+    cx = float(FRAME_WIDTH) * 0.9
+    cy = float(FRAME_HEIGHT) * 0.5
+    eng = _eng_centered(cx, cy)
+    eng.engage()
+    r = _run_with_ramp(eng)
+    assert r.rc_roll > RC_MID, (
+        f"Цель далеко справа (cx={cx:.0f}, err_x≈{cx - FRAME_WIDTH/2:.0f}): "
+        f"rc_roll={r.rc_roll} ≤ RC_MID={RC_MID}. Roll assist не работает."
+    )
+
+
+def test_roll_assist_applied_when_target_far_left():
+    """При err_x < -ROLL_ASSIST_THRESHOLD → rc_roll < RC_MID (крен влево)."""
+    cx = float(FRAME_WIDTH) * 0.1   # 64 — далеко слева
+    cy = float(FRAME_HEIGHT) * 0.5
+    eng = _eng_centered(cx, cy)
+    eng.engage()
+    r = _run_with_ramp(eng)
+    assert r.rc_roll < RC_MID, (
+        f"Цель далеко слева (cx={cx:.0f}, err_x≈{cx - FRAME_WIDTH/2:.0f}): "
+        f"rc_roll={r.rc_roll} ≥ RC_MID={RC_MID}. Roll assist не работает."
+    )
+
+
+def test_roll_assist_not_applied_when_target_centered():
+    """При |err_x| ≤ ROLL_ASSIST_THRESHOLD → rc_roll = RC_RELEASE (оператор)."""
+    cx = float(FRAME_WIDTH)  * 0.5   # err_x = 0
+    cy = float(FRAME_HEIGHT) * 0.5
+    eng = _eng_centered(cx, cy)
+    eng.engage()
+    r = _run_with_ramp(eng)
+    assert r.rc_roll == RC_RELEASE, (
+        f"Цель по центру (err_x=0): rc_roll={r.rc_roll}, ожидался RC_RELEASE={RC_RELEASE}"
+    )
+
+
+# ─── 11. STRIKING throttle boost ────────────────────────────────────────────
+
+def test_striking_throttle_boost():
+    """
+    Во время STRIKING throttle может достигать RC_THROTTLE_STRIKING=1800,
+    а не ограничен RC_THROTTLE_MAX=1650.
+    """
+    # Цель ниже центра: pid_alt генерирует throttle < RC_MID (снижение)
+    # Нам нужна цель ВЫШЕ центра (err_y < 0) → throttle > RC_MID
+    cx = float(FRAME_WIDTH)  * 0.5
+    cy = float(FRAME_HEIGHT) * 0.1   # цель высоко → err_y < 0 → throttle > RC_MID
+
+    bbox   = (int(cx - 20), int(cy - 20), int(cx + 20), int(cy + 20))
+    vision = (float(cx), float(cy), 0.9, bbox)
+    eng    = TrackerEngine()
+    eng._vision.step           = lambda f, y: vision
+    eng._vision.get_lead_point = lambda: (float(cx), float(cy))
+    eng._vision.get_velocity   = lambda: (0.0, 0.0)
+    eng._vision.reset          = lambda: None
+    eng.engage()
+
+    # Промотать за RAMP_DURATION_SEC → STRIKING
+    future = time.monotonic() + RAMP_DURATION_SEC + THROTTLE_RAMP_SEC + 0.2
+    with patch("tracker_engine.time") as mt:
+        mt.monotonic.return_value = future
+        r = eng.step(_DET, _FRAME)
+
+    assert r.state == TrackerState.STRIKING
+    # В STRIKING throttle может быть до RC_THROTTLE_STRIKING=1800
+    assert r.rc_throttle <= RC_THROTTLE_STRIKING, (
+        f"rc_throttle={r.rc_throttle} > RC_THROTTLE_STRIKING={RC_THROTTLE_STRIKING}"
+    )
+    assert r.rc_throttle >= RC_THROTTLE_MIN
+
+
+def test_striking_throttle_cap_higher_than_tracking():
+    """RC_THROTTLE_STRIKING (1800) > RC_THROTTLE_MAX (1650) — проверить константы."""
+    assert RC_THROTTLE_STRIKING > RC_THROTTLE_MAX, (
+        f"RC_THROTTLE_STRIKING={RC_THROTTLE_STRIKING} должен быть > "
+        f"RC_THROTTLE_MAX={RC_THROTTLE_MAX}"
+    )
