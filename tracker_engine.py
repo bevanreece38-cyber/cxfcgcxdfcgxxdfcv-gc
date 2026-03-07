@@ -36,6 +36,7 @@ from config import (
     PITCH_NEAR, PITCH_DIVE,
     RAMP_DURATION_SEC, THROTTLE_RAMP_SEC,
     DEAD_RECKONING_SEC, REACQUIRE_TIMEOUT,
+    REACQUIRE_VELOCITY_DECAY, REACQUIRE_CONFIRM_SEC,
     MAX_FPS,
     KP_YAW, KI_YAW, KD_YAW,
     KP_ALT, KI_ALT, KD_ALT,
@@ -98,8 +99,11 @@ class TrackerEngine:
         self._throttle_ramp_start = 0.0
         self._dead_reckon_start   = 0.0   # момент потери цели (DEAD_RECKON таймер)
         self._reacquire_start     = 0.0   # момент входа в REACQUIRE
-        self._reacquire_pos: Tuple[float, float] = (0.0, 0.0)  # последняя известная позиция
-        self._reacquire_vel: Tuple[float, float] = (0.0, 0.0)  # Kalman velocity при потере
+        self._reacquire_pos: Tuple[float, float] = (0.0, 0.0)
+        self._reacquire_vel: Tuple[float, float] = (0.0, 0.0)
+        # Recovery confirmation (PixEagle паттерн):
+        # цель должна стабильно отслеживаться REACQUIRE_CONFIRM_SEC до возврата в TRACKING
+        self._reacquire_confirm_start: float = 0.0
 
     @property
     def state(self) -> TrackerState:
@@ -110,14 +114,15 @@ class TrackerEngine:
         self._vision.reset()
         self._pid_yaw.reset()
         self._pid_alt.reset()
-        self._ramp_start          = time.monotonic()
-        self._ramp_progress       = 0.0
-        self._throttle_ramp       = 0.0
-        self._throttle_ramp_start = time.monotonic()
-        self._dead_reckon_start   = 0.0
-        self._reacquire_start     = 0.0
-        self._reacquire_pos       = (0.0, 0.0)
-        self._reacquire_vel       = (0.0, 0.0)
+        self._ramp_start              = time.monotonic()
+        self._ramp_progress           = 0.0
+        self._throttle_ramp           = 0.0
+        self._throttle_ramp_start     = time.monotonic()
+        self._dead_reckon_start       = 0.0
+        self._reacquire_start         = 0.0
+        self._reacquire_pos           = (0.0, 0.0)
+        self._reacquire_vel           = (0.0, 0.0)
+        self._reacquire_confirm_start = 0.0
         self._state = TrackerState.ACQUIRING
         logger.info("TrackerEngine: ENGAGE → ACQUIRING")
 
@@ -126,10 +131,11 @@ class TrackerEngine:
         self._vision.reset()
         self._pid_yaw.reset()
         self._pid_alt.reset()
-        self._ramp_progress     = 0.0
-        self._throttle_ramp     = 0.0
-        self._dead_reckon_start = 0.0
-        self._reacquire_start   = 0.0
+        self._ramp_progress           = 0.0
+        self._throttle_ramp           = 0.0
+        self._dead_reckon_start       = 0.0
+        self._reacquire_start         = 0.0
+        self._reacquire_confirm_start = 0.0
         self._state = TrackerState.IDLE
         logger.info("TrackerEngine: DISENGAGE → IDLE")
 
@@ -172,7 +178,33 @@ class TrackerEngine:
         vision_result = self._vision.step(frame, yolo_outputs)
 
         if vision_result is None:
+            # Нет детекции → потеря цели
+            self._reacquire_confirm_start = 0.0   # сброс подтверждения recovery
             return self._handle_lost()
+
+        # --- Цель найдена ---
+        # Recovery confirmation (PixEagle паттерн):
+        # При возврате из REACQUIRE требуем стабильного трекинга REACQUIRE_CONFIRM_SEC
+        if self._state == TrackerState.REACQUIRE:
+            now = time.monotonic()
+            if self._reacquire_confirm_start == 0.0:
+                # Первый кадр возврата — начинаем отсчёт подтверждения
+                self._reacquire_confirm_start = now
+                logger.debug("TrackerEngine: REACQUIRE — начало recovery confirmation")
+            elif (now - self._reacquire_confirm_start) < REACQUIRE_CONFIRM_SEC:
+                # Ещё не подтверждено — ждём стабильности REACQUIRE_CONFIRM_SEC.
+                # Состояние остаётся REACQUIRE; RC-команды считаются ниже
+                # с _in_reacquire_confirm=True чтобы не перезаписать состояние.
+                pass
+            else:
+                # Подтверждено: цель стабильно отслеживается REACQUIRE_CONFIRM_SEC
+                self._state = TrackerState.TRACKING
+                self._reacquire_confirm_start = 0.0
+                logger.info(f"TrackerEngine: REACQUIRE → TRACKING (подтверждено "
+                            f"{REACQUIRE_CONFIRM_SEC}с стабильного трекинга)")
+        elif self._state == TrackerState.DEAD_RECKON:
+            # Возврат из DEAD_RECKON — сразу восстанавливаем TRACKING (быстрый переход)
+            self._state = TrackerState.TRACKING
 
         cx, cy, conf, bbox = vision_result
         lead_x, lead_y = self._vision.get_lead_point()
@@ -220,12 +252,23 @@ class TrackerEngine:
         rc_roll = self._compute_roll_assist(err_x)
 
         # --- Состояние + throttle cap ---
-        if self._ramp_progress >= 1.0:
+        # _in_reacquire_confirm: цель найдена, но подтверждение ещё не завершено.
+        # В этом случае НЕ переводим в TRACKING/STRIKING — ждём REACQUIRE_CONFIRM_SEC.
+        # После подтверждения состояние уже переведено в TRACKING выше (строки 197–202).
+        _in_reacquire_confirm = (
+            self._state == TrackerState.REACQUIRE
+            and self._reacquire_confirm_start > 0.0
+        )
+
+        if self._ramp_progress >= 1.0 and not _in_reacquire_confirm:
             self._state = TrackerState.STRIKING
-            # Максимальное ускорение при финальном ударе
             rc_throttle = int(np.clip(raw_throttle, RC_THROTTLE_MIN, RC_THROTTLE_STRIKING))
-        else:
+        elif not _in_reacquire_confirm:
+            # TRACKING (нормальный полёт) или только что подтверждённый TRACKING
             self._state = TrackerState.TRACKING
+            rc_throttle = int(np.clip(raw_throttle, RC_THROTTLE_MIN, RC_THROTTLE_MAX))
+        else:
+            # REACQUIRE подтверждение в процессе: безопасный throttle, состояние = REACQUIRE
             rc_throttle = int(np.clip(raw_throttle, RC_THROTTLE_MIN, RC_THROTTLE_MAX))
 
         return TrackResult(
@@ -290,24 +333,31 @@ class TrackerEngine:
                 self._state = TrackerState.LOST
                 logger.warning("TrackerEngine: ACQUIRING timeout → LOST")
 
-        # REACQUIRE: манёвр по Kalman velocity
+        # REACQUIRE: манёвр по Kalman velocity с затуханием (PixEagle паттерн)
         if self._state == TrackerState.REACQUIRE:
             elapsed = now - self._reacquire_start
             if elapsed >= REACQUIRE_TIMEOUT:
                 self._state = TrackerState.LOST
                 logger.warning("TrackerEngine: REACQUIRE → LOST (таймер истёк)")
             else:
-                # Экстраполяция позиции цели по последней скорости.
+                # Velocity decay (PixEagle ENABLE_VELOCITY_DECAY паттерн):
+                # vx_now = vx_at_loss * decay_rate^elapsed_sec
+                # 0.85^1 = 85%, 0.85^2 = 72%, 0.85^3 = 61%
+                # Предотвращает уход дрона при длительной потере цели
+                decay = REACQUIRE_VELOCITY_DECAY ** elapsed
+                vx_decayed = self._reacquire_vel[0] * decay
+                vy_decayed = self._reacquire_vel[1] * decay
+
+                # Экстраполяция позиции цели по затухающей скорости.
                 # frames_elapsed — приближение: предполагается постоянный MAX_FPS.
                 # При реальном FPS, отличном от MAX_FPS, погрешность пропорциональна
                 # разнице скоростей — допустимо в пределах REACQUIRE_TIMEOUT=1.5с.
                 frames_elapsed = elapsed * MAX_FPS
-                vx, vy         = self._reacquire_vel
                 pred_x = float(np.clip(
-                    self._reacquire_pos[0] + vx * frames_elapsed, 0.0, FRAME_WIDTH
+                    self._reacquire_pos[0] + vx_decayed * frames_elapsed, 0.0, FRAME_WIDTH
                 ))
                 pred_y = float(np.clip(
-                    self._reacquire_pos[1] + vy * frames_elapsed, 0.0, FRAME_HEIGHT
+                    self._reacquire_pos[1] + vy_decayed * frames_elapsed, 0.0, FRAME_HEIGHT
                 ))
                 err_x = pred_x - FRAME_WIDTH  / 2.0
                 err_y = pred_y - FRAME_HEIGHT / 2.0

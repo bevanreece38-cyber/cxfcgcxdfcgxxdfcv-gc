@@ -536,7 +536,11 @@ def test_reacquire_rc_throttle_is_mid():
 
 
 def test_reacquire_recovery_to_tracking():
-    """Цель вернулась во время REACQUIRE → TRACKING."""
+    """
+    Цель вернулась во время REACQUIRE → TRACKING после REACQUIRE_CONFIRM_SEC.
+    (PixEagle recovery_confirmation_time: требует стабильности перед переходом)
+    """
+    from config import REACQUIRE_CONFIRM_SEC
     eng = _eng([_HIT] * 5 + [None] * 200)
     eng.engage()
     for _ in range(5):
@@ -549,10 +553,17 @@ def test_reacquire_recovery_to_tracking():
         mt.monotonic.return_value = future
         eng.step(_DET, _FRAME)
 
-    # Target returns — swap vision mock to return detection
+    # Target returns — first step starts the confirmation timer
     eng._vision.step = lambda f, y: _HIT
+    t_found = future + 0.05
     with patch("tracker_engine.time") as mt:
-        mt.monotonic.return_value = future + 0.1
+        mt.monotonic.return_value = t_found
+        eng.step(_DET, _FRAME)   # starts confirmation
+
+    # After REACQUIRE_CONFIRM_SEC → TRACKING confirmed
+    t_confirmed = t_found + REACQUIRE_CONFIRM_SEC + 0.05
+    with patch("tracker_engine.time") as mt:
+        mt.monotonic.return_value = t_confirmed
         r = eng.step(_DET, _FRAME)
     assert r.state in (TrackerState.TRACKING, TrackerState.STRIKING), (
         f"Цель вернулась во время REACQUIRE: ожидался TRACKING, получен {r.state}"
@@ -640,4 +651,133 @@ def test_striking_throttle_cap_higher_than_tracking():
     assert RC_THROTTLE_STRIKING > RC_THROTTLE_MAX, (
         f"RC_THROTTLE_STRIKING={RC_THROTTLE_STRIKING} должен быть > "
         f"RC_THROTTLE_MAX={RC_THROTTLE_MAX}"
+    )
+
+
+# ─── 12. PixEagle: velocity decay в REACQUIRE ────────────────────────────────
+
+def test_reacquire_velocity_decays_over_time():
+    """
+    Velocity decay: rc_yaw ближе к RC_MID в конце REACQUIRE, чем в начале.
+    (PixEagle ENABLE_VELOCITY_DECAY паттерн: decay = 0.85^elapsed)
+    """
+    from config import REACQUIRE_VELOCITY_DECAY, DEAD_RECKONING_SEC
+
+    # Цель движется вправо с высокой скоростью
+    vx_fast = 60.0
+    vy_fast = 0.0
+    cx = float(FRAME_WIDTH) * 0.8
+    cy = float(FRAME_HEIGHT) * 0.5
+    bbox   = (int(cx - 20), int(cy - 20), int(cx + 20), int(cy + 20))
+    vision = (cx, cy, 0.9, bbox)
+
+    eng = TrackerEngine()
+    eng._vision.step           = lambda f, y: vision
+    eng._vision.get_lead_point = lambda: (cx, cy)
+    eng._vision.get_velocity   = lambda: (vx_fast, vy_fast)
+    eng._vision.reset          = lambda: None
+    eng.engage()
+    for _ in range(5):
+        eng.step(_DET, _FRAME)
+
+    # Enter DEAD_RECKON
+    eng._vision.step = lambda f, y: None
+    eng.step(_DET, _FRAME)
+
+    # DEAD_RECKON → REACQUIRE
+    t_loss = time.monotonic()
+    future1 = t_loss + DEAD_RECKONING_SEC + 0.05
+    with patch("tracker_engine.time") as mt:
+        mt.monotonic.return_value = future1
+        eng.step(_DET, _FRAME)
+    assert eng._state == TrackerState.REACQUIRE
+
+    # Измерить rc_yaw сразу после входа (маленький elapsed → малое затухание)
+    future_early = future1 + 0.1
+    with patch("tracker_engine.time") as mt:
+        mt.monotonic.return_value = future_early
+        r_early = eng.step(_DET, _FRAME)
+
+    # Измерить rc_yaw ближе к концу REACQUIRE (большой elapsed → сильное затухание)
+    from config import REACQUIRE_TIMEOUT
+    future_late = future1 + REACQUIRE_TIMEOUT * 0.9
+    with patch("tracker_engine.time") as mt:
+        mt.monotonic.return_value = future_late
+        r_late = eng.step(_DET, _FRAME)
+
+    if r_early.state == TrackerState.REACQUIRE and r_late.state == TrackerState.REACQUIRE:
+        # Более позднее → скорость меньше → yaw ближе к RC_MID
+        early_err = abs(r_early.rc_yaw - RC_MID)
+        late_err  = abs(r_late.rc_yaw  - RC_MID)
+        assert late_err <= early_err + 5, (  # 5 PWM допуск
+            f"Velocity decay: late_err={late_err} должен быть ≤ early_err={early_err} "
+            f"(rc_yaw: early={r_early.rc_yaw}, late={r_late.rc_yaw})"
+        )
+
+
+# ─── 13. PixEagle: recovery confirmation ─────────────────────────────────────
+
+def test_reacquire_recovery_requires_confirmation():
+    """
+    При первом обнаружении цели в REACQUIRE состояние НЕ меняется на TRACKING —
+    нужно подтверждение REACQUIRE_CONFIRM_SEC (PixEagle recovery_confirmation_time).
+    """
+    from config import REACQUIRE_CONFIRM_SEC, DEAD_RECKONING_SEC
+
+    eng = _eng([_HIT] * 5 + [None] * 200)
+    eng.engage()
+    for _ in range(5):
+        eng.step(_DET, _FRAME)
+    eng.step(_DET, _FRAME)   # DEAD_RECKON
+
+    # Enter REACQUIRE
+    future = time.monotonic() + DEAD_RECKONING_SEC + 0.05
+    with patch("tracker_engine.time") as mt:
+        mt.monotonic.return_value = future
+        eng.step(_DET, _FRAME)
+    assert eng._state == TrackerState.REACQUIRE
+
+    # Target returns — but too early for confirmation
+    eng._vision.step = lambda f, y: _HIT
+    too_early = future + REACQUIRE_CONFIRM_SEC * 0.3
+    with patch("tracker_engine.time") as mt:
+        mt.monotonic.return_value = too_early
+        r = eng.step(_DET, _FRAME)
+    # Should still be REACQUIRE (not confirmed yet)
+    assert r.state == TrackerState.REACQUIRE, (
+        f"Слишком рано для подтверждения: ожидался REACQUIRE, получен {r.state}"
+    )
+
+
+def test_reacquire_recovery_confirmed_after_delay():
+    """
+    После REACQUIRE_CONFIRM_SEC стабильного трекинга → переход в TRACKING.
+    """
+    from config import REACQUIRE_CONFIRM_SEC, DEAD_RECKONING_SEC
+
+    eng = _eng([_HIT] * 5 + [None] * 200)
+    eng.engage()
+    for _ in range(5):
+        eng.step(_DET, _FRAME)
+    eng.step(_DET, _FRAME)   # DEAD_RECKON
+
+    future = time.monotonic() + DEAD_RECKONING_SEC + 0.05
+    with patch("tracker_engine.time") as mt:
+        mt.monotonic.return_value = future
+        eng.step(_DET, _FRAME)
+    assert eng._state == TrackerState.REACQUIRE
+
+    # Target returns and is confirmed
+    eng._vision.step = lambda f, y: _HIT
+    # First detection — starts confirm timer
+    with patch("tracker_engine.time") as mt:
+        mt.monotonic.return_value = future
+        eng.step(_DET, _FRAME)
+    # After REACQUIRE_CONFIRM_SEC — confirmed
+    confirmed_time = future + REACQUIRE_CONFIRM_SEC + 0.05
+    with patch("tracker_engine.time") as mt:
+        mt.monotonic.return_value = confirmed_time
+        r = eng.step(_DET, _FRAME)
+    assert r.state in (TrackerState.TRACKING, TrackerState.STRIKING), (
+        f"Подтверждён REACQUIRE_CONFIRM_SEC: ожидался TRACKING, получен {r.state}"
     )

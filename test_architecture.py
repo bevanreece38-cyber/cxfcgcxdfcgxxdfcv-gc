@@ -79,16 +79,20 @@ def test_vision_tracker_step_signature_frame_first():
     """
     VisionTracker.step() принимает frame первым позиционным аргументом.
     Это ИСПРАВЛЕНО: старая сигнатура была step(yolo_outputs, frame).
+
+    Примечание: params[0] = 'self', поэтому первый реальный аргумент — params[1].
+    TrackerEngine.step() имеет ДРУГУЮ сигнатуру: step(yolo_outputs, frame) —
+    это намеренно (разные уровни абстракции).
     """
     from vision_tracker import VisionTracker
     sig    = inspect.signature(VisionTracker.step)
     params = list(sig.parameters.keys())
     assert params[1] == "frame", (
-        f"Первый аргумент step() должен быть 'frame', получен '{params[1]}'. "
-        f"Порядок аргументов: {params}"
+        f"Первый аргумент после self должен быть 'frame', получен '{params[1]}'. "
+        f"Полный список параметров: {params}"
     )
     assert params[2] == "yolo_outputs", (
-        f"Второй аргумент step() должен быть 'yolo_outputs', получен '{params[2]}'."
+        f"Второй аргумент после self должен быть 'yolo_outputs', получен '{params[2]}'."
     )
 
 
@@ -211,18 +215,22 @@ def test_handle_lost_returns_track_result_not_rc_command():
     """
     _handle_lost() в TrackerEngine возвращает TrackResult.
     Он НЕ отправляет RC команды напрямую — это делает main.py через ControlManager.
+
+    Примечание: TrackerEngine.step(yolo_outputs, frame) принимает yolo_outputs первым —
+    это НЕ противоречит VisionTracker.step(frame, yolo_outputs). TrackerEngine —
+    публичный API для main.py, VisionTracker — внутренний компонент.
+    eng.step(None, frame) корректно передаёт yolo_outputs=None (нет детекции).
     """
     import numpy as np
     from tracker_engine import TrackerEngine, TrackResult
     from types_enum import TrackerState
     from config import RC_MID, RC_RELEASE
 
-    eng = TrackerEngine()
+    eng   = TrackerEngine()
     eng.engage()
-
-    # Симулируем потерю цели
     frame = np.zeros((480, 640, 3), dtype=np.uint8)
-    result = eng.step(None, frame)   # None вместо YOLO → потеря цели
+    # TrackerEngine.step(yolo_outputs, frame): None = нет YOLO детекции
+    result = eng.step(None, frame)
 
     # _handle_lost вернул TrackResult — не отправил RC команду
     assert isinstance(result, TrackResult), (

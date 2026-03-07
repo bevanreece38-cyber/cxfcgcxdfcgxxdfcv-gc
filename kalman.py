@@ -10,17 +10,31 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
+# EMA α для сглаживания скорости (PixEagle MotionPredictor паттерн)
+# 0.7 = 70% вес нового измерения, 30% — история (быстрый отклик + сглаживание)
+_VEL_EMA_ALPHA = 0.7
+# EMA α для ускорения (более консервативный — нет резких скачков)
+_ACC_EMA_ALPHA = 0.5
+# Максимальное ускорение px/кадр² (защита от выброса)
+_MAX_ACCEL_PF2 = 10.0
+
 
 class KalmanTargetTracker:
     """
-    Kalman фильтр 4D для сглаживания позиции и скорости цели.
+    Kalman фильтр 4D [x, y, vx, vy] + EMA velocity smoothing + acceleration tracking.
 
-    Состояние вектора: [x, y, vx, vy]
-      x, y   — позиция в пикселях
-      vx, vy — скорость в пикселях/кадр
+    Архитектура по образцу PixEagle MotionPredictor:
+      1. cv2.KalmanFilter(4, 2) — основное сглаживание позиции и скорости.
+      2. EMA (Exponential Moving Average) поверх Kalman-скорости — стабильнее
+         при резких изменениях курса цели.
+      3. Оценка ускорения из разности скоростей — для кинематического прогноза
+         по уравнению: pos + vel*t + 0.5*accel*t² (15–25% точнее при t > 5 кадров).
 
-    predict_with_velocity() возвращает (x, y, vx, vy) для
-    расчёта точки упреждения (predictive intercept).
+    Единицы скорости: пиксели/кадр (совместимо с lead_point и REACQUIRE).
+    Конвертация в пиксели/секунду: умножить на MAX_FPS.
+
+    predict_with_velocity()       → (x, y, vx_ema, vy_ema)
+    predict_with_acceleration()   → (x, y, vx_ema, vy_ema, ax, ay)
     """
 
     def __init__(self, frame_width: int, frame_height: int):
@@ -28,6 +42,7 @@ class KalmanTargetTracker:
         self.frame_h = frame_height
         dt = 1.0 / MAX_FPS
 
+        # --- cv2.KalmanFilter ---
         self.kf = cv2.KalmanFilter(4, 2)
         self.kf.transitionMatrix = np.array([
             [1, 0, dt, 0],
@@ -39,14 +54,25 @@ class KalmanTargetTracker:
             [1, 0, 0, 0],
             [0, 1, 0, 0],
         ], dtype=np.float32)
-        self.kf.errorCovPost     = np.eye(4, dtype=np.float32) * KALMAN_ERROR_COV_INIT
-        self.kf.processNoiseCov  = np.eye(4, dtype=np.float32) * KALMAN_PROCESS_NOISE
+        self.kf.errorCovPost        = np.eye(4, dtype=np.float32) * KALMAN_ERROR_COV_INIT
+        self.kf.processNoiseCov     = np.eye(4, dtype=np.float32) * KALMAN_PROCESS_NOISE
         self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * KALMAN_MEASUREMENT_NOISE
         self.kf.statePost = np.array(
             [[frame_width / 2.0], [frame_height / 2.0], [0.0], [0.0]],
             dtype=np.float32,
         )
         self._predicted_this_step = False
+
+        # --- EMA velocity (px/frame) — сглаживание поверх Kalman ---
+        self._ema_vx: float = 0.0
+        self._ema_vy: float = 0.0
+
+        # --- EMA acceleration (px/frame²) — кинематический прогноз ---
+        self._ema_ax: float = 0.0
+        self._ema_ay: float = 0.0
+        self._prev_ema_vx: float = 0.0
+        self._prev_ema_vy: float = 0.0
+        self._update_count: int  = 0   # число update() — нужно ≥ 2 для ускорения
 
     def _ensure_predict(self):
         if not self._predicted_this_step:
@@ -61,13 +87,31 @@ class KalmanTargetTracker:
     def predict_with_velocity(self):
         """
         Возвращает (x, y, vx, vy).
-        vx, vy в пикселях/кадр — используются для упреждения.
+        vx, vy — EMA-сглаженная скорость в пикселях/кадр.
         """
         self._ensure_predict()
         s = self.kf.statePost
         return (
             float(s[0][0]), float(s[1][0]),
-            float(s[2][0]), float(s[3][0]),
+            self._ema_vx, self._ema_vy,
+        )
+
+    def predict_with_acceleration(self):
+        """
+        Возвращает (x, y, vx, vy, ax, ay).
+        Для кинематического прогноза: pos + vel*t + 0.5*accel*t²
+        Ускорение доступно только после ≥ 2 вызовов update().
+        ax, ay в пикселях/кадр².
+
+        Паттерн PixEagle MotionPredictor.predict_bbox(use_acceleration=True):
+          pred_cx = cx + velocity_x * dt + 0.5 * accel_x * dt²
+        """
+        self._ensure_predict()
+        s = self.kf.statePost
+        return (
+            float(s[0][0]), float(s[1][0]),
+            self._ema_vx, self._ema_vy,
+            self._ema_ax, self._ema_ay,
         )
 
     def update(self, measurement):
@@ -78,6 +122,31 @@ class KalmanTargetTracker:
         )
         self.kf.correct(meas)
         self._predicted_this_step = False
+
+        # Получаем raw-скорость из Kalman и применяем EMA
+        raw_vx = float(self.kf.statePost[2][0])
+        raw_vy = float(self.kf.statePost[3][0])
+
+        prev_ema_vx = self._ema_vx
+        prev_ema_vy = self._ema_vy
+
+        # EMA velocity smoothing (PixEagle: alpha=0.7)
+        self._ema_vx = _VEL_EMA_ALPHA * raw_vx + (1.0 - _VEL_EMA_ALPHA) * self._ema_vx
+        self._ema_vy = _VEL_EMA_ALPHA * raw_vy + (1.0 - _VEL_EMA_ALPHA) * self._ema_vy
+
+        self._update_count += 1
+
+        # EMA acceleration smoothing (нужно ≥ 2 обновлений)
+        if self._update_count >= 2:
+            inst_ax = self._ema_vx - prev_ema_vx   # px/frame² (ускорение за один кадровый интервал)
+            inst_ay = self._ema_vy - prev_ema_vy
+            # Клампируем для защиты от выброса
+            inst_ax = float(np.clip(inst_ax, -_MAX_ACCEL_PF2, _MAX_ACCEL_PF2))
+            inst_ay = float(np.clip(inst_ay, -_MAX_ACCEL_PF2, _MAX_ACCEL_PF2))
+            # EMA acceleration smoothing (PixEagle: alpha=0.5 — консервативнее)
+            self._ema_ax = _ACC_EMA_ALPHA * inst_ax + (1.0 - _ACC_EMA_ALPHA) * self._ema_ax
+            self._ema_ay = _ACC_EMA_ALPHA * inst_ay + (1.0 - _ACC_EMA_ALPHA) * self._ema_ay
+
         return (float(self.kf.statePost[0][0]), float(self.kf.statePost[1][0]))
 
     def begin_step(self):
@@ -92,3 +161,10 @@ class KalmanTargetTracker:
         )
         self.kf.errorCovPost      = np.eye(4, dtype=np.float32) * KALMAN_ERROR_COV_INIT
         self._predicted_this_step = False
+        self._ema_vx   = 0.0
+        self._ema_vy   = 0.0
+        self._ema_ax   = 0.0
+        self._ema_ay   = 0.0
+        self._prev_ema_vx  = 0.0
+        self._prev_ema_vy  = 0.0
+        self._update_count = 0
