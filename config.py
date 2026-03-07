@@ -58,7 +58,7 @@ KEEPALIVE_HZ = 25
 
 # --- Dead reckoning ---
 # 89 м/с * 0.4 сек = 35 м — допустимо для перехвата
-DEAD_RECKONING_SEC = 0.4
+DEAD_RECKONING_SEC = 0.25
 
 # --- Predictive intercept (упреждение точки наводки) ---
 # Наводимся не на текущую позицию, а на прогнозную точку через LEAD_TIME_SEC
