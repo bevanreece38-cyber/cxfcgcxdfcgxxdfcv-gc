@@ -36,6 +36,7 @@ from config import (
     KP_YAW, KI_YAW, KD_YAW,
     KP_ALT, KI_ALT, KD_ALT,
     TARGET_CLASS_ID, CONF_THRESHOLD,
+    MAX_RC_DELTA_PER_FRAME,
 )
 from types_enum import TrackerState
 from pid import PIDController
@@ -72,6 +73,13 @@ def _lost_result(ramp: float = 0.0) -> TrackResult:
     return TrackResult(state=TrackerState.LOST, ramp_progress=ramp)
 
 
+def _rate_limit(new_val: int, prev_val: int) -> int:
+    """Ограничить скорость изменения RC значения за один кадр."""
+    delta = int(np.clip(new_val - prev_val,
+                        -MAX_RC_DELTA_PER_FRAME, MAX_RC_DELTA_PER_FRAME))
+    return prev_val + delta
+
+
 class TrackerEngine:
     """
     Полный алгоритм перехвата цели.
@@ -92,6 +100,10 @@ class TrackerEngine:
         self._ramp_progress = 0.0
         self._throttle_ramp = 0.0   # отдельная рампа для throttle
         self._throttle_ramp_start = 0.0
+        # Предыдущие RC значения для rate limiting (плавность без рывков)
+        self._prev_yaw      = RC_MID
+        self._prev_throttle = RC_MID
+        self._prev_pitch    = RC_MID
 
     @property
     def state(self) -> TrackerState:
@@ -106,6 +118,9 @@ class TrackerEngine:
         self._ramp_progress = 0.0
         self._throttle_ramp = 0.0
         self._throttle_ramp_start = time.monotonic()
+        self._prev_yaw      = RC_MID
+        self._prev_throttle = RC_MID
+        self._prev_pitch    = RC_MID
         self._state = TrackerState.ACQUIRING
         logger.info("TrackerEngine: ENGAGE → ACQUIRING")
 
@@ -116,6 +131,9 @@ class TrackerEngine:
         self._pid_alt.reset()
         self._ramp_progress = 0.0
         self._throttle_ramp = 0.0
+        self._prev_yaw      = RC_MID
+        self._prev_throttle = RC_MID
+        self._prev_pitch    = RC_MID
         self._state = TrackerState.IDLE
         logger.info("TrackerEngine: DISENGAGE → IDLE")
 
@@ -188,7 +206,15 @@ class TrackerEngine:
         # --- D. ROLL — всегда passthrough (оператор управляет креном) ---
         rc_roll = RC_RELEASE
 
-        # --- Состояние ---
+        # --- E. Rate limiting — плавность RC без рывков (MAX_RC_DELTA_PER_FRAME) ---
+        rc_yaw      = _rate_limit(rc_yaw,      self._prev_yaw)
+        rc_throttle = _rate_limit(rc_throttle, self._prev_throttle)
+        rc_pitch    = _rate_limit(rc_pitch,    self._prev_pitch)
+
+        self._prev_yaw      = rc_yaw
+        self._prev_throttle = rc_throttle
+        self._prev_pitch    = rc_pitch
+
         if self._ramp_progress >= 1.0:
             self._state = TrackerState.STRIKING
         else:

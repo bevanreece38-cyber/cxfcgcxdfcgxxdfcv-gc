@@ -41,15 +41,43 @@ VisionResult = Optional[Tuple[float, float, float, Tuple[int, int, int, int]]]
 
 
 def _create_opencv_tracker() -> cv2.Tracker:
-    """Создать OpenCV трекер (CSRT или KCF)."""
+    """Создать OpenCV трекер с fallback цепочкой: CSRT → KCF → MIL."""
     t = TRACKER_TYPE.upper()
-    if t == "CSRT":
-        return cv2.TrackerCSRT_create()
-    elif t == "KCF":
-        return cv2.TrackerKCF_create()
-    else:
-        logger.warning(f"Неизвестный трекер '{TRACKER_TYPE}', используем CSRT")
-        return cv2.TrackerCSRT_create()
+
+    # Пробуем создать запрошенный тип, затем fallback
+    candidates = [t] if t in ("CSRT", "KCF") else ["CSRT"]
+    if "KCF" not in candidates:
+        candidates.append("KCF")
+    candidates.append("MIL")   # последний fallback
+
+    for name in candidates:
+        # Сначала пробуем прямой атрибут (opencv-contrib или новые версии)
+        factory_direct = getattr(cv2, f"Tracker{name}_create", None)
+        if factory_direct is not None:
+            try:
+                tracker = factory_direct()
+                if name != t:
+                    logger.warning(f"Трекер '{t}' недоступен, используем {name}")
+                return tracker
+            except Exception:
+                pass
+
+        # Затем пробуем через cv2.legacy (opencv-contrib ≥4.5)
+        legacy = getattr(cv2, "legacy", None)
+        if legacy is not None:
+            factory_legacy = getattr(legacy, f"Tracker{name}_create", None)
+            if factory_legacy is not None:
+                try:
+                    tracker = factory_legacy()
+                    if name != t:
+                        logger.warning(
+                            f"Трекер '{t}' недоступен, используем legacy.{name}"
+                        )
+                    return tracker
+                except Exception:
+                    pass
+
+    raise RuntimeError("Не удалось создать ни один OpenCV трекер (CSRT/KCF/MIL)")
 
 
 class VisionTracker:
