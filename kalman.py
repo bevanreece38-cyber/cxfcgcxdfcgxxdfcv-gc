@@ -56,7 +56,7 @@ class KalmanTargetTracker:
     def predict_only(self):
         """Возвращает (x, y) прогнозную позицию."""
         self._ensure_predict()
-        return (float(self.kf.statePost[0]), float(self.kf.statePost[1]))
+        return (float(self.kf.statePost[0][0]), float(self.kf.statePost[1][0]))
 
     def predict_with_velocity(self):
         """
@@ -66,8 +66,8 @@ class KalmanTargetTracker:
         self._ensure_predict()
         s = self.kf.statePost
         return (
-            float(s[0]), float(s[1]),
-            float(s[2]), float(s[3]),
+            float(s[0][0]), float(s[1][0]),
+            float(s[2][0]), float(s[3][0]),
         )
 
     def update(self, measurement):
@@ -78,7 +78,7 @@ class KalmanTargetTracker:
         )
         self.kf.correct(meas)
         self._predicted_this_step = False
-        return (float(self.kf.statePost[0]), float(self.kf.statePost[1]))
+        return (float(self.kf.statePost[0][0]), float(self.kf.statePost[1][0]))
 
     def begin_step(self):
         """Сбросить флаг предсказания — вызывать в начале каждого кадра."""

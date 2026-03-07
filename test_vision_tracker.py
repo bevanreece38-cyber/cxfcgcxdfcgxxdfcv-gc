@@ -101,3 +101,39 @@ def test_step_signature_frame_first():
     # Должен принимать frame первым аргументом
     result = vt.step(frame, det)
     assert result is not None
+
+
+def test_csrt_tracks_between_yolo():
+    """CSRT работает между кадрами YOLO (yolo_outputs=None)."""
+    vt = VisionTracker()
+    vt.reset()
+    frame = _textured_frame()
+    # Первый кадр: YOLO детекция — инициализируем CSRT
+    result1 = vt.step(frame, _det(320, 240))
+    assert result1 is not None
+    # Следующие кадры: без YOLO — CSRT трекает на том же текстурированном кадре
+    result2 = vt.step(frame, None)
+    # На текстурированном кадре CSRT должен вернуть результат
+    assert result2 is not None
+    cx2, cy2, _, _ = result2
+    # CSRT на одном кадре: допуск 80 пикселей (размер bbox = 40 px, сдвиг мал)
+    MAX_CSRT_DEVIATION = 80
+    assert abs(cx2 - 320) < MAX_CSRT_DEVIATION
+    assert abs(cy2 - 240) < MAX_CSRT_DEVIATION
+
+
+def test_lead_point_calculation():
+    """Точка упреждения вычисляется корректно и лежит в границах кадра."""
+    vt = VisionTracker()
+    vt.reset()
+    frame = _textured_frame()
+    initial_x = 350
+    # Несколько кадров с движущейся целью (справа налево)
+    for x in (initial_x, 340, 330, 320):
+        vt.step(frame, _det(x, 240))
+    lx, ly = vt.get_lead_point()
+    # Точка упреждения должна лежать в пределах кадра
+    assert 0 <= lx <= 640
+    assert 0 <= ly <= 480
+    # При движении влево lead_x должна быть левее начальной позиции цели
+    assert lx < initial_x

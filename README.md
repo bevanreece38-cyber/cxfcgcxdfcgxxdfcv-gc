@@ -1,0 +1,116 @@
+# Interceptor System
+
+Система автономного перехвата воздушных целей на базе Radxa Rock 5B + SpeedyBee F405 + ArduPilot.
+
+## Аппаратура
+
+```
+RadioMaster TX → ELRS 2.4GHz → Приёмник → SpeedyBee F405 (ArduPilot AltHold)
+SpeedyBee F405 ↔ Radxa Rock 5B (UART /dev/ttyS2, 115200 baud, MAVLink)
+Radxa Rock 5B  ← Цифровая камера USB (/dev/video1)
+Radxa Rock 5B  → Wi-Fi → Оператор (MJPEG :5000 / H.264 RTP :5600)
+```
+
+## Тактика
+
+| Параметр | Значение |
+|---|---|
+| Скорость нашего дрона | ~150 км/ч (41.7 м/с) |
+| Скорость цели | 160–180 км/ч (44–50 м/с) |
+| Лобовое сближение | до 330 км/ч (91 м/с) |
+| Упреждение (LEAD_TIME_SEC) | 0.12 сек (~11 м при 91 м/с) |
+
+## Логика управления
+
+- **CH10 OFF** → AltHold, оператор управляет с пульта; YOLO рисует зелёные рамки на видео
+- **CH10 ON** → `take_control()` → трекинг (YOLO + CSRT + Kalman + PID) + кинетический удар
+- **Потеря цели** → `release_control()` (все каналы = 65535 passthrough → ELRS пульт)
+- **SAFETY** → `release_control()` + `MAV_CMD_NAV_LAND`
+
+## Архитектура (PixEagle + DroneEngage)
+
+```
+VideoStream (GStreamer MJPEG, нон-блокирующий)
+    │
+    ▼
+NPUHandler (RK3588 NPU_CORE_0_1_2, YOLO каждые 2 кадра)
+    │
+    ▼
+VisionTracker
+  ├─ YOLO детекция (NPU, каждые YOLO_EVERY_N_FRAMES кадров)
+  ├─ CSRT трекинг (CPU, каждый кадр между YOLO)
+  └─ KalmanTargetTracker (сглаживание + скорость → упреждение)
+    │
+    ▼
+TrackerEngine
+  ├─ Predictive intercept: lead_x/y = pos + velocity * LEAD_FACTOR * LEAD_TIME_SEC
+  ├─ PID yaw   (err_x → rc_yaw)
+  ├─ PID alt   (err_y → rc_throttle, с рампой THROTTLE_RAMP_SEC)
+  └─ Pitch рампа (RC_MID → PITCH_DIVE за RAMP_DURATION_SEC)
+    │
+    ▼
+ControlManager (DroneEngage)
+  ├─ take_control() / release_control()
+  ├─ Keepalive поток 25 Гц (ArduPilot требует >3 Гц)
+  └─ RC_RELEASE = 65535 (passthrough → ELRS пульт)
+```
+
+## RC_CHANNELS_OVERRIDE
+
+| Канал | Управляет | Значение при трекинге |
+|---|---|---|
+| CH1 Roll | Оператор | 65535 (passthrough) |
+| CH2 Pitch | Компьютер | 1280–1450 (рампа пикирования) |
+| CH3 Throttle | Компьютер | 1350–1650 (рампа ускорения) |
+| CH4 Yaw | Компьютер | 1100–1900 (PID наводка) |
+| CH5–CH18 | Оператор | 65535 (passthrough) |
+
+**ВАЖНО**: `RC_RELEASE = 65535` — passthrough ArduPilot читает канал с ELRS пульта.
+Значение `0` означает минимальный PWM — дрон упадёт!
+
+## Установка зависимостей
+
+```bash
+pip install -r requirements.txt
+```
+
+> **На Radxa Rock 5B** дополнительно требуется `rknnlite` из SDK Rockchip:
+> ```bash
+> pip install rknnlite
+> ```
+
+## Запуск
+
+```bash
+python main.py
+```
+
+- MJPEG видеопоток: `http://<radxa-ip>:5000/stream`
+- Health-check: `http://<radxa-ip>:5000/health`
+- H.264 RTP (QGroundControl / VLC): `udp://@:5600`
+
+## Структура файлов
+
+| Файл | Описание |
+|---|---|
+| `main.py` | Главный цикл приложения |
+| `config.py` | Все параметры системы |
+| `tracker_engine.py` | 3D алгоритм перехвата (PID + рампы) |
+| `vision_tracker.py` | YOLO + CSRT + Kalman (PixEagle) |
+| `kalman.py` | Kalman фильтр 4D (x, y, vx, vy) |
+| `control_manager.py` | RC override MAVLink (DroneEngage) |
+| `pid.py` | PID регулятор |
+| `handler.py` | MAVLink соединение |
+| `state.py` | Разбор телеметрии ArduPilot |
+| `safety.py` | Мониторинг безопасности |
+| `npu.py` | RK3588 NPU YOLO инференс |
+| `video_stream.py` | Захват видео GStreamer / V4L2 |
+| `gstreamer_output.py` | H.264 RTP/UDP выход |
+| `flight_logger.py` | CSV лог полётных данных |
+
+## Запуск тестов
+
+```bash
+pip install pytest opencv-contrib-python numpy
+pytest -v
+```
