@@ -21,11 +21,13 @@ def _make():
 
 
 def test_rc_release_is_passthrough():
-    """КРИТИЧНО: RC_RELEASE должен быть 65535, не 0."""
+    """КРИТИЧНО: RC_RELEASE должен быть 65535 (UINT16_MAX = passthrough).
+    65535 → ArduPilot игнорирует поле → канал управляется ELRS пультом.
+    0     → set_override(i,0) → has_override()=false → мгновенный аппаратный RC.
+    release_control() отправляет 0, keepalive отправляет 65535.
+    """
     assert RC_RELEASE == 65535, (
-        f"RC_RELEASE={RC_RELEASE} — ОПАСНО! "
-        f"0 = минимальный PWM, дрон упадёт. "
-        f"Должно быть 65535 (passthrough к ELRS пульту)."
+        f"RC_RELEASE={RC_RELEASE} — должно быть 65535 (UINT16_MAX = passthrough)."
     )
 
 

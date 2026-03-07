@@ -18,18 +18,20 @@ class FlightLogger:
 
     def __init__(self):
         os.makedirs(LOG_DIR, exist_ok=True)
-        self.file_path = os.path.join(
+        self.file_path    = os.path.join(
             LOG_DIR,
             f"flight_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
         )
-        self.handle    = None
-        self.flush_cnt = 0
+        self.handle       = None
+        self.flush_cnt    = 0
+        self._written     = 0   # байт записано в текущий файл (без os.path.getsize)
         self._create()
 
     def _create(self):
         try:
             # buffering=4096: OS-буфер 4 КБ → сброс каждые ~20 строк (не 30×/сек)
-            self.handle = open(self.file_path, 'w', buffering=4096)
+            self.handle   = open(self.file_path, 'w', buffering=4096)
+            self._written = len(self.HEADER.encode())
             self.handle.write(self.HEADER)
             self.handle.flush()
             logger.info(f"FlightLogger: {self.file_path}")
@@ -41,15 +43,6 @@ class FlightLogger:
         if not self.handle:
             return
         try:
-            if os.path.getsize(self.file_path) > MAX_LOG_SIZE:
-                self.handle.close()
-                self.file_path = os.path.join(
-                    LOG_DIR,
-                    f"flight_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                )
-                self._create()
-                if not self.handle:
-                    return
             line = (
                 f"{d.get('ts',    0):.3f},"
                 f"{d.get('tx',   -1):.1f},"
@@ -74,7 +67,19 @@ class FlightLogger:
                 f"{d.get('lead_x',-1):.1f},"
                 f"{d.get('lead_y',-1):.1f}\n"
             )
+            # Ротация файла по размеру — через in-memory счётчик, без os.path.getsize()
+            # os.path.getsize() вызывался при каждой записи (30 Гц = 30 syscall/s)
+            if self._written + len(line) > MAX_LOG_SIZE:
+                self.handle.close()
+                self.file_path = os.path.join(
+                    LOG_DIR,
+                    f"flight_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                )
+                self._create()
+                if not self.handle:
+                    return
             self.handle.write(line)
+            self._written  += len(line)
             self.flush_cnt += 1
             if self.flush_cnt >= 50:
                 self.handle.flush()

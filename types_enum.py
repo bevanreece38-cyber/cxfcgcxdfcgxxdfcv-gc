@@ -5,7 +5,6 @@ class SafetyStatus(Enum):
     OK      = 0
     WARNING = 1
     LAND    = 2
-    HOVER   = 3
 
 
 class TrackerState(Enum):

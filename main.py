@@ -111,6 +111,11 @@ def _encode_worker():
             logger.debug(f"_encode_worker: {e}")
 
 
+# Запускаем поток на уровне модуля — активен сразу при импорте main.
+# В InterceptorApp.__init__ повторный старт не нужен.
+threading.Thread(target=_encode_worker, name="jpeg-encode", daemon=True).start()
+
+
 class StreamHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass  # не спамим в консоль
@@ -123,7 +128,7 @@ class StreamHandler(BaseHTTPRequestHandler):
             self.send_header('Cache-Control', 'no-cache')
             self.send_header('Connection', 'keep-alive')
             self.end_headers()
-            last_sent_jpeg = None  # last JPEG object we last_sent_jpeg (identity check)
+            last_sent_jpeg = None  # последний отправленный JPEG (identity check)
             while True:
                 try:
                     with _STREAM_COND:
@@ -234,9 +239,6 @@ class InterceptorApp:
         # MJPEG HTTP сервер (браузер / FPV монитор)
         self.server = ThreadedHTTPServer(('0.0.0.0', STREAM_PORT), StreamHandler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
-
-        # Фоновый поток JPEG-кодирования (нулевая задержка стрима)
-        threading.Thread(target=_encode_worker, name="jpeg-encode", daemon=True).start()
 
         logger.info(f"MJPEG  → http://0.0.0.0:{STREAM_PORT}/stream")
         logger.info(f"Health → http://0.0.0.0:{STREAM_PORT}/health")
@@ -399,17 +401,17 @@ class InterceptorApp:
             TrackerState.DEAD_RECKON: (0, 255, 255),
         }.get(r.state, (255, 255, 0))
 
-        # Текущая позиция цели (кружок)
-        fill = -1 if r.state == TrackerState.STRIKING else 2
-        cv2.circle(frame, (tx, ty), 14, color, fill)
-        cv2.rectangle(frame, (tx - 22, ty - 22), (tx + 22, ty + 22), color, 1)
+        # Текущая позиция цели (рисуем только если координаты валидны)
+        if r.target_x >= 0 and r.target_y >= 0:
+            fill = -1 if r.state == TrackerState.STRIKING else 2
+            cv2.circle(frame, (tx, ty), 14, color, fill)
+            cv2.rectangle(frame, (tx - 22, ty - 22), (tx + 22, ty + 22), color, 1)
 
-        # Точка упреждения (крестик) — куда наводимся
-        cv2.drawMarker(frame, (lx, ly), (255, 100, 0),
-                       cv2.MARKER_CROSS, 20, 2)
-
-        # Линия от центра к точке упреждения
-        cv2.line(frame, (cx, cy), (lx, ly), (255, 100, 0), 1)
+            # Точка упреждения и линия к ней (только при валидных координатах)
+            if r.lead_x >= 0 and r.lead_y >= 0:
+                cv2.drawMarker(frame, (lx, ly), (255, 100, 0),
+                               cv2.MARKER_CROSS, 20, 2)
+                cv2.line(frame, (cx, cy), (lx, ly), (255, 100, 0), 1)
 
         # Состояние
         cv2.putText(frame, r.state.value, (10, 30),
@@ -535,10 +537,11 @@ class InterceptorApp:
         if self.gst_output:
             self.gst_output.stop()
         self.mav.release()
-        try:
-            self.npu.release()
-        except Exception:
-            pass
+        if self.npu is not None:
+            try:
+                self.npu.release()
+            except Exception:
+                pass
         self.flight_log.close()
         try:
             self.server.server_close()
