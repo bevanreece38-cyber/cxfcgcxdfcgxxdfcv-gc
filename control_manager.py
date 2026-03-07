@@ -7,9 +7,12 @@ https://github.com/DroneEngage/droneengage_mavlink
   - take_control() / release_control() — явная передача управления
   - Keepalive поток 25 Гц пока override активен
     (ArduPilot требует обновление >3 Гц, иначе снимает override)
-  - release = все каналы = RC_RELEASE (65535)
-    65535 = passthrough: ArduPilot читает этот канал с ELRS пульта
-    ВАЖНО: НЕ 0 ! 0 = минимальный PWM = дрон упадёт!
+  - release = CH1-8 отправляем 0, keepalive останавливаем
+    Подтверждено исходником ArduPilot GCS_Common.cpp:
+      0 → set_override(i,0) → override_value=0 → has_override()=false
+      → МГНОВЕННЫЙ переход к аппаратному RC без ожидания таймаута
+  - RC_RELEASE = 65535 используется в keepalive для каналов которые
+    оператор контролирует сам (ArduPilot игнорирует поле, не меняет override)
   - Тройная отправка release для надёжности
 """
 
@@ -29,11 +32,21 @@ _KEEPALIVE_INTERVAL = 1.0 / KEEPALIVE_HZ
 
 def _clamp(value: int) -> int:
     """
-    RC_RELEASE (65535) = passthrough: отдать канал оператору.
-    Иначе клампим в безопасный диапазон 800-2200.
+    Два специальных значения проходят без изменений:
+      RC_RELEASE = 65535 — MAVLink «ignore this field» (не обновляет override).
+      0                  — явное снятие override для CH1-8; ArduPilot сразу
+                           возвращает канал к аппаратному RC (has_override()=false).
+    Всё остальное клампится в безопасный диапазон 800-2200.
+
+    Источник: ArduPilot GCS_Common.cpp handle_rc_channels_override():
+      CH1-8:  0 → set_override(i,0) → override_value=0 → has_override()=false
+      CH1-8:  65535 → пропускается (not != UINT16_MAX), override не обновляется
+      CH9-16: 0 и 65535 — оба игнорируются ArduPilot
     """
-    if value == RC_RELEASE:
+    if value == RC_RELEASE:   # 65535 — MAVLink "ignore this field"
         return RC_RELEASE
+    if value == 0:            # явный сброс override → аппаратный RC
+        return 0
     return max(800, min(2200, int(value)))
 
 
@@ -89,8 +102,20 @@ class ControlManager:
 
     def release_control(self) -> bool:
         """
-        Возвращает управление оператору.
-        Все каналы = 65535 (passthrough) → ArduPilot читает ELRS пульт.
+        Возвращает управление оператору — НЕМЕДЛЕННО.
+
+        Механизм (подтверждено исходным кодом ArduPilot GCS_Common.cpp):
+          CH1-8:  отправляем 0 → ArduPilot вызывает set_override(i, 0)
+                  → override_value=0 → has_override()=false
+                  → МГНОВЕННЫЙ переход на аппаратный RC (ELRS пульт)
+          CH9-18: 0 игнорируется ArduPilot для этих каналов, но keepalive
+                  уже остановлен → override истекает по таймауту (~1.5 сек)
+
+        Почему НЕ 65535 для release:
+          65535 = UINT16_MAX = «игнорировать поле» — ArduPilot НЕ вызывает
+          set_override(), old override_value остаётся активным до таймаута.
+          При закрытии 91 м/с задержка 1.5 сек = 137 м после команды «стоп»!
+
         Тройная отправка для надёжности (DroneEngage паттерн).
         """
         self._stop_event.set()
@@ -100,12 +125,13 @@ class ControlManager:
 
         with self._lock:
             self._state    = ControlState.MANUAL
-            # Passthrough на всех каналах = оператор получает управление
             self._channels = [RC_RELEASE] * _NUM_CHANNELS
 
-        # Тройная отправка для надёжности
+        # CH1-8: 0 → set_override(i,0) → has_override()=false → аппаратный RC
+        # CH9-18: 0 игнорируется ArduPilot, keepalive остановлен → таймаут
+        _release_packet = [0] * _NUM_CHANNELS
         for _ in range(3):
-            self._send_raw([RC_RELEASE] * _NUM_CHANNELS)
+            self._send_raw(_release_packet)
         logger.info("✈ release_control() — управление возвращено оператору (ELRS)")
         return True
 

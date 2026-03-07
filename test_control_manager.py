@@ -41,8 +41,16 @@ def test_take_control():
     c.release_control()
 
 
-def test_release_sends_passthrough():
-    """release_control() должен отправить все каналы = 65535 (passthrough)."""
+def test_release_sends_zero_for_immediate_handover():
+    """
+    release_control() должен отправить 0 для CH1-8.
+
+    Подтверждено исходником ArduPilot GCS_Common.cpp:
+      CH1-8: 0 → set_override(i,0) → override_value=0 → has_override()=false
+             → МГНОВЕННЫЙ возврат к аппаратному RC (ELRS пульт)
+      65535 → UINT16_MAX → игнорируется ArduPilot → override остаётся активным
+              до истечения RC_OVERRIDE_TIME (~1.5 сек)!
+    """
     c, m = _make()
     c.take_control()
     time.sleep(0.1)
@@ -50,8 +58,9 @@ def test_release_sends_passthrough():
     assert len(m.sent) > 0
     last = m.sent[-1]
     channels = last[2:]
-    assert all(ch == RC_RELEASE for ch in channels), (
-        f"release_control() отправил не passthrough значения: {channels[:4]}"
+    assert all(ch == 0 for ch in channels), (
+        f"release_control() должен отправить 0 для мгновенного сброса override, "
+        f"получили: {channels[:4]}"
     )
 
 
@@ -108,5 +117,42 @@ def test_clamp_limits():
     for pkt in m.sent:
         if len(pkt) > 5:
             yaw_val = pkt[5]  # CH4 = index 5 (target_sys, target_comp, CH1..CH4...)
-            if yaw_val != RC_RELEASE:
+            if yaw_val != RC_RELEASE and yaw_val != 0:
                 assert yaw_val <= 2200, f"yaw={yaw_val} вышел за 2200"
+
+
+def test_clamp_passthrough():
+    """_clamp(65535) должен вернуть 65535 — MAVLink «ignore this field»."""
+    assert _clamp(RC_RELEASE) == RC_RELEASE, (
+        f"_clamp({RC_RELEASE}) вернул не RC_RELEASE: ожидали {RC_RELEASE}"
+    )
+
+
+def test_clamp_zero_passes_through():
+    """
+    _clamp(0) должен вернуть 0.
+
+    0 — явный сброс override для CH1-8: ArduPilot вызовет set_override(i,0)
+    → override_value=0 → has_override()=false → мгновенный аппаратный RC.
+    Нельзя клампить до 800 — это сломает мгновенный release_control().
+    """
+    assert _clamp(0) == 0, "_clamp(0) должен вернуть 0 (явный сброс override)"
+
+
+def test_release_triple_send():
+    """release_control() отправляет 3 пакета подряд для надёжности."""
+    c, m = _make()
+    c.take_control()
+    before = len(m.sent)
+    c.release_control()
+    release_pkts = m.sent[before:]
+    # Минимум 3 пакета от тройной отправки (keepalive мог добавить ещё)
+    assert len(release_pkts) >= 3, (
+        f"Ожидали ≥3 пакетов release, получили {len(release_pkts)}"
+    )
+    # Все release пакеты должны содержать 0
+    for pkt in release_pkts:
+        channels = pkt[2:]
+        assert all(ch == 0 for ch in channels), (
+            f"release пакет содержит не 0: {channels[:4]}"
+        )

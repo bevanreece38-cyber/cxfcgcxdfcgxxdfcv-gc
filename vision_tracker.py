@@ -9,6 +9,9 @@ https://github.com/alireza787b/PixEagle
   3. Kalman фильтр — сглаживание + velocity → predictive lead point
   4. При каждой YOLO детекции → переинициализация CSRT (коррекция дрейфа)
 
+Выбор приоритетной цели: максимальный confidence score среди TARGET_CLASS_ID.
+При нескольких одинаковых — уверенность YOLO важнее расстояния до центра.
+
 Возвращает:
   (cx, cy, conf, bbox) или None если цель не найдена.
 

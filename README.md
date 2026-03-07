@@ -82,12 +82,12 @@ pip install -r requirements.txt
 ## Запуск
 
 ```bash
-python main.py
+python3 main.py
 ```
 
 - MJPEG видеопоток: `http://<radxa-ip>:5000/stream`
 - Health-check: `http://<radxa-ip>:5000/health`
-- H.264 RTP (QGroundControl / VLC): `udp://@:5600`
+- H.264 RTP (QGroundControl / VLC): `rtp://@:5600`
 
 ## Структура файлов
 
@@ -107,6 +107,39 @@ python main.py
 | `video_stream.py` | Захват видео GStreamer / V4L2 |
 | `gstreamer_output.py` | H.264 RTP/UDP выход |
 | `flight_logger.py` | CSV лог полётных данных |
+
+## RC_CHANNELS_OVERRIDE: 0 vs 65535
+
+Подтверждено исходным кодом ArduPilot `GCS_Common.cpp`:
+
+| Значение | CH1–8 | CH9–18 |
+|----------|-------|--------|
+| **0** | `set_override(i,0)` → `has_override()=false` → **мгновенный аппаратный RC** | игнорируется |
+| **65535** | игнорируется (UINT16_MAX filter) — старый override остаётся до таймаута | игнорируется |
+| **1000–2000** | применяется как PWM override | применяется |
+
+**Вывод:**
+- `release_control()` посылает `0` для CH1–8 → мгновенный возврат к ELRS пульту
+- Keepalive посылает `65535` для каналов оператора → ArduPilot их не трогает
+- `RC_RELEASE = 65535` в коде означает «не override этот канал» во время keepalive
+
+## PID настройки для высокоскоростных целей
+
+Пересчитано для скорости сближения до 91 м/с:
+
+| Параметр | Значение | Назначение |
+|----------|----------|-----------|
+| `KP_YAW` | 0.8 | Быстрый отклик по рысканию |
+| `KI_YAW` | 0.008 | Малый интеграл — цель резко меняет курс |
+| `KD_YAW` | 0.15 | Демпфирование при рывках |
+| `KP_ALT` | 1.0 | Быстрый отклик по высоте |
+| `KI_ALT` | 0.015 | Малый интеграл |
+| `KD_ALT` | 0.2 | Демпфирование |
+| `RAMP_DURATION_SEC` | 0.6 | Рампа pitch: 91 м/с × 0.6 с = 55 м до удара |
+| `THROTTLE_RAMP_SEC` | 0.8 | Рампа throttle: плавный набор без рывков |
+| `LEAD_TIME_SEC` | 0.12 | Упреждение 120 мс ≈ 11 м при 91 м/с |
+| `LEAD_FACTOR` | 2.5 | Усилитель velocity из Kalman |
+| `DEAD_RECKONING_SEC` | 0.4 | Dead reckoning: 91 м/с × 0.4 с = 36 м |
 
 ## Запуск тестов
 
