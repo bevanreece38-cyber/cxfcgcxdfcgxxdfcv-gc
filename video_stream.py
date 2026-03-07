@@ -112,7 +112,7 @@ class VideoStream:
                 f"! jpegdec "
                 f"! videoconvert "
                 f"! video/x-raw,format=BGR "
-                f"! appsink drop=1"
+                f"! appsink drop=true max-buffers=1 sync=false"
             )
         else:
             # YUYV
@@ -122,7 +122,7 @@ class VideoStream:
                 f"height={self.height},framerate={self.fps}/1 "
                 f"! videoconvert "
                 f"! video/x-raw,format=BGR "
-                f"! appsink drop=1"
+                f"! appsink drop=true max-buffers=1 sync=false"
             )
         try:
             cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
@@ -135,6 +135,9 @@ class VideoStream:
         """Прямой захват через V4L2."""
         try:
             cap = cv2.VideoCapture(self.src, cv2.CAP_V4L2)
+            # Минимальный внутренний буфер V4L2 — всегда читаем последний кадр.
+            # По умолчанию OpenCV держит 4 кадра → задержка до 133 мс.
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
             cap.set(cv2.CAP_PROP_FPS,          self.fps)

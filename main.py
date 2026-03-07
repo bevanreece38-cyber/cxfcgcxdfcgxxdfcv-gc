@@ -25,6 +25,7 @@ Interceptor System — Radxa Rock 5B + SpeedyBee F405 + ArduPilot
 
 import cv2
 import numpy as np
+import queue
 import time
 import sys
 import signal
@@ -67,10 +68,47 @@ logger = setup_logger(__name__)
 MAX_MAVLINK_MSGS_PER_TICK = 50
 
 # ========================
-#  MJPEG СТРИМИНГ
+#  MJPEG СТРИМИНГ — НУЛЕВАЯ ЗАДЕРЖКА
 # ========================
+# Архитектура:
+#   1. Основной RC-цикл → resize → _RAW_FRAME_Q (maxsize=1, drop old)
+#   2. _encode_worker (фоновый поток) → imencode → LATEST_JPEG + notify _STREAM_COND
+#   3. StreamHandler (по потоку на клиента) → wait_for(_STREAM_COND) → send немедленно
+#
+# Результат:
+#   - RC-цикл освобождён от imencode (~4 мс)
+#   - StreamHandler не имеет sleep → кадр уходит клиенту сразу после кодирования
+#   - GStreamer appsink: max-buffers=1 sync=false (нет буферизации в драйвере)
+
 LATEST_JPEG: Optional[bytes] = None
-LATEST_JPEG_LOCK = threading.Lock()
+_STREAM_COND  = threading.Condition()          # будит StreamHandler-ы при новом JPEG
+_RAW_FRAME_Q: queue.Queue = queue.Queue(maxsize=1)  # BGR → encode thread
+
+
+def _encode_worker():
+    """
+    Фоновый поток JPEG-кодирования.
+    Берёт из _RAW_FRAME_Q (уже масштабированный кадр), кодирует в JPEG,
+    кладёт в LATEST_JPEG и будит все ждущие StreamHandler-ы.
+    Работает параллельно с основным RC-циклом.
+    """
+    global LATEST_JPEG
+    while True:
+        try:
+            try:
+                frame = _RAW_FRAME_Q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            ok, buf = cv2.imencode(
+                '.jpg', frame,
+                [int(cv2.IMWRITE_JPEG_QUALITY), STREAM_QUALITY],
+            )
+            if ok:
+                with _STREAM_COND:
+                    LATEST_JPEG = buf.tobytes()
+                    _STREAM_COND.notify_all()  # немедленно будим все StreamHandler-ы
+        except Exception as e:
+            logger.debug(f"_encode_worker: {e}")
 
 
 class StreamHandler(BaseHTTPRequestHandler):
@@ -85,22 +123,28 @@ class StreamHandler(BaseHTTPRequestHandler):
             self.send_header('Cache-Control', 'no-cache')
             self.send_header('Connection', 'keep-alive')
             self.end_headers()
+            last_sent_jpeg = None  # last JPEG object we last_sent_jpeg (identity check)
             while True:
                 try:
-                    with LATEST_JPEG_LOCK:
+                    with _STREAM_COND:
+                        # Ждём НОВЫЙ кадр (отличный по identity от last_sent_jpeg).
+                        # wait_for освобождает _STREAM_COND пока ждёт — нет блокировки.
+                        # timeout=0.5 — keepalive при отсутствии кадров.
+                        if not _STREAM_COND.wait_for(
+                            lambda: LATEST_JPEG is not None and LATEST_JPEG is not last_sent_jpeg,
+                            timeout=0.5,
+                        ):
+                            continue   # timeout, проверяем снова
                         jpeg = LATEST_JPEG
-                    if jpeg is not None:
-                        self.wfile.write(b'--frame\r\n')
-                        self.wfile.write(b'Content-Type: image/jpeg\r\n')
-                        self.wfile.write(
-                            f'Content-Length: {len(jpeg)}\r\n'.encode())
-                        self.wfile.write(b'\r\n')
-                        self.wfile.write(jpeg)
-                        self.wfile.write(b'\r\n')
-                    else:
-                        time.sleep(0.05)
-                        continue
-                    time.sleep(1.0 / MAX_FPS)
+                    # Обновляем маркер ПОСЛЕ выхода из блока with (вне lock)
+                    last_sent_jpeg = jpeg
+                    self.wfile.write(b'--frame\r\n')
+                    self.wfile.write(b'Content-Type: image/jpeg\r\n')
+                    self.wfile.write(
+                        f'Content-Length: {len(jpeg)}\r\n'.encode())
+                    self.wfile.write(b'\r\n')
+                    self.wfile.write(jpeg)
+                    self.wfile.write(b'\r\n')
                 except (BrokenPipeError, ConnectionResetError):
                     break
                 except Exception:
@@ -182,6 +226,9 @@ class InterceptorApp:
         # MJPEG HTTP сервер (браузер / FPV монитор)
         self.server = ThreadedHTTPServer(('0.0.0.0', STREAM_PORT), StreamHandler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+        # Фоновый поток JPEG-кодирования (нулевая задержка стрима)
+        threading.Thread(target=_encode_worker, name="jpeg-encode", daemon=True).start()
 
         logger.info(f"MJPEG  → http://0.0.0.0:{STREAM_PORT}/stream")
         logger.info(f"Health → http://0.0.0.0:{STREAM_PORT}/health")
@@ -409,17 +456,30 @@ class InterceptorApp:
         self._push_frame_raw(frame)
 
     def _push_frame_raw(self, frame: np.ndarray):
-        """Отправить кадр в MJPEG и GStreamer потоки."""
-        global LATEST_JPEG
-        # Масштабируем для стрима (экономия CPU + Wi-Fi)
-        sf = cv2.resize(frame, (STREAM_WIDTH, STREAM_HEIGHT))
-        ok, jpeg = cv2.imencode(
-            '.jpg', sf, [int(cv2.IMWRITE_JPEG_QUALITY), STREAM_QUALITY])
-        if ok:
-            with LATEST_JPEG_LOCK:
-                LATEST_JPEG = jpeg.tobytes()
+        """
+        Отправить кадр в MJPEG и GStreamer потоки.
 
-        # H.264 RTP для QGroundControl / VLC
+        JPEG кодирование вынесено в _encode_worker (фоновый поток):
+          - RC-цикл НЕ блокируется на imencode (~4 мс экономии)
+          - Кадр уходит клиенту немедленно после кодирования (нет sleep)
+        cv2.resize создаёт новый массив → безопасно для многопоточности.
+        """
+        # Масштабируем до размера стрима (один раз для обоих выходов)
+        sf = cv2.resize(frame, (STREAM_WIDTH, STREAM_HEIGHT))
+
+        # Помещаем в очередь encode-потока (drop old при переполнении).
+        # Т.к. только главный цикл пишет в очередь, после get_nowait()
+        # очередь гарантированно пуста → второй put_nowait не бросит Full.
+        try:
+            _RAW_FRAME_Q.put_nowait(sf)
+        except queue.Full:
+            try:
+                _RAW_FRAME_Q.get_nowait()   # выбросить устаревший кадр
+            except queue.Empty:
+                pass  # encode-поток уже взял его — очередь и так пуста
+            _RAW_FRAME_Q.put_nowait(sf)     # теперь очередь точно пуста
+
+        # H.264 RTP для QGroundControl / VLC (encode в фоновом потоке GStreamer)
         if self.gst_output and self.gst_output.is_active:
             self.gst_output.send_frame(sf)
 
