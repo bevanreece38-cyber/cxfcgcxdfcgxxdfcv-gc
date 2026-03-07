@@ -28,7 +28,8 @@ class FlightLogger:
 
     def _create(self):
         try:
-            self.handle = open(self.file_path, 'w', buffering=1)
+            # buffering=4096: OS-буфер 4 КБ → сброс каждые ~20 строк (не 30×/сек)
+            self.handle = open(self.file_path, 'w', buffering=4096)
             self.handle.write(self.HEADER)
             self.handle.flush()
             logger.info(f"FlightLogger: {self.file_path}")

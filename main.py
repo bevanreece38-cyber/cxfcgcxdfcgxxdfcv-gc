@@ -9,17 +9,18 @@ Interceptor System — Radxa Rock 5B + SpeedyBee F405 + ArduPilot
 
 Логика:
   CH10 OFF: AltHold, оператор управляет пультом
-            YOLO детекция → зелёные прямоугольники на видео для оператора
+            YOLO детекция каждый кадр → зелёные рамки для оператора
   CH10 ON:  take_control() → TrackerEngine.engage()
             Kalman predictive lead → PID yaw+throttle → pitch рампа → удар
-            Потеря цели → release_control() (все каналы = 65535 passthrough)
-  CH10 OFF: release_control() → управление возвращается ELRS пульту
+            Потеря цели → release_control()
+  CH10 OFF: release_control() → CH1-8 отправляем 0 (мгновенный сброс override)
   SAFETY:   release_control() + MAV_CMD_NAV_LAND
 
-ИСПРАВЛЕНО:
-  - RC_RELEASE = 65535 (passthrough), НЕ 0
-  - TrackerEngine.step(yolo_outputs, frame) — правильный порядок аргументов
-  - Плавная рампа throttle (нет рывков при захвате)
+КЛЮЧЕВЫЕ ДЕТАЛИ:
+  - RC_RELEASE = 65535 используется в keepalive (UINT16_MAX = «ignore field»)
+  - release_control() шлёт 0 для CH1-8 → ArduPilot МГНОВЕННО возвращает
+    управление ELRS пульту (без ожидания RC_OVERRIDE_TIME таймаута)
+  - YOLO каждые YOLO_EVERY_N_FRAMES кадров в атаке; каждый кадр в пассиве
 """
 
 import cv2
@@ -43,7 +44,7 @@ from config import (
     GSTREAMER_ENABLED, GSTREAMER_HOST, GSTREAMER_PORT,
     GSTREAMER_WIDTH, GSTREAMER_HEIGHT, GSTREAMER_FPS,
     GSTREAMER_BITRATE, GSTREAMER_ENABLE_HW,
-    RC_RELEASE,
+    RC_RELEASE, YOLO_EVERY_N_FRAMES,
 )
 from types_enum import SafetyStatus, TrackerState
 from utils import setup_logger
@@ -175,6 +176,9 @@ class InterceptorApp:
         # Последний результат тр��кера (для CSV лога)
         self._last_result: TrackResult = _idle_result()
 
+        # Счётчик кадров для троттлинга YOLO (NPU тяжёлый — не каждый кадр)
+        self._yolo_frame_idx: int = 0
+
         # MJPEG HTTP сервер (браузер / FPV монитор)
         self.server = ThreadedHTTPServer(('0.0.0.0', STREAM_PORT), StreamHandler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -216,7 +220,7 @@ class InterceptorApp:
                     if self.ctrl.is_controlling:
                         logger.critical("SAFETY → принудительный release_control()")
                         self.tracker.disengage()
-                        self.ctrl.release_control()  # все каналы = 65535 passthrough
+                        self.ctrl.release_control()  # CH1-8 → 0 (мгновенный сброс override)
                     self.safety.execute_safety_action(safety_status, self.ctrl)
                     self._last_result = _idle_result()
                     self._push_frame(frame, "SAFETY", (0, 0, 255))
@@ -224,8 +228,13 @@ class InterceptorApp:
                     self._limit_fps(t0)
                     continue
 
-                # 4. NPU YOLO инференс (RK3588, ~15 мс)
-                outputs_pp = self._run_inference(frame)
+                # 4. NPU YOLO инференс с троттлингом
+                # Пассив: каждый кадр → оператор видит все цели в реальном времени
+                # Атака: каждые YOLO_EVERY_N_FRAMES кадров → CSRT заполняет промежутки
+                # Это освобождает ~8 мс NPU на каждом втором кадре в боевом режиме
+                self._yolo_frame_idx = (self._yolo_frame_idx + 1) % YOLO_EVERY_N_FRAMES
+                run_yolo = (not state.attack_switch) or (self._yolo_frame_idx == 0)
+                outputs_pp = self._run_inference(frame) if run_yolo else None
 
                 # 5. Логика CH10 — атака или пассив
                 if state.attack_switch:
@@ -284,7 +293,7 @@ class InterceptorApp:
             # LOST: цель потеряна → немедленно отдать управление оператору
             logger.warning("Цель LOST → release_control() → оператор")
             self.tracker.disengage()
-            self.ctrl.release_control()  # all channels = 65535 passthrough
+            self.ctrl.release_control()  # CH1-8 → 0 (мгновенный сброс override)
             self._push_frame(frame, "LOST — MANUAL", (0, 255, 255))
 
     # ================================================================
@@ -295,7 +304,7 @@ class InterceptorApp:
         if self.ctrl.is_controlling:
             logger.info("CH10 OFF → release_control() → ELRS пульт")
             self.tracker.disengage()
-            self.ctrl.release_control()  # все каналы = 65535 passthrough
+            self.ctrl.release_control()  # CH1-8 → 0 (мгновенный сброс override)
 
         self._last_result = _idle_result()
 

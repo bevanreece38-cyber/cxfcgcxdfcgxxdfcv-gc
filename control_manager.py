@@ -170,6 +170,15 @@ class ControlManager:
     def state(self) -> ControlState:
         return self._state
 
+    def __del__(self):
+        """Страховочный release при уничтожении объекта (краш Python, KeyboardInterrupt)."""
+        try:
+            if self._state == ControlState.COMPUTER:
+                logger.warning("__del__: принудительный release_control()")
+                self.release_control()
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     #  Внутренние методы
     # ------------------------------------------------------------------
