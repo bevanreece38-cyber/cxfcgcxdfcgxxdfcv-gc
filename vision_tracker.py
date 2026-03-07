@@ -41,15 +41,28 @@ VisionResult = Optional[Tuple[float, float, float, Tuple[int, int, int, int]]]
 
 
 def _create_opencv_tracker() -> cv2.Tracker:
-    """Создать OpenCV трекер (CSRT или KCF)."""
+    """Создать OpenCV трекер (CSRT или KCF).
+
+    В OpenCV 4.5+ legacy-трекеры перенесены в cv2.legacy.
+    Пробуем новый API (legacy), при неудаче — старый API.
+    """
     t = TRACKER_TYPE.upper()
-    if t == "CSRT":
-        return cv2.TrackerCSRT_create()
-    elif t == "KCF":
-        return cv2.TrackerKCF_create()
-    else:
-        logger.warning(f"Неизвестный трекер '{TRACKER_TYPE}', используем CSRT")
-        return cv2.TrackerCSRT_create()
+    try:
+        if t == "CSRT":
+            return cv2.legacy.TrackerCSRT_create()
+        elif t == "KCF":
+            return cv2.legacy.TrackerKCF_create()
+        else:
+            logger.warning(f"Неизвестный трекер '{TRACKER_TYPE}', используем CSRT")
+            return cv2.legacy.TrackerCSRT_create()
+    except AttributeError:
+        # Старые версии OpenCV (<4.5): трекеры в корне cv2
+        if t == "CSRT":
+            return cv2.TrackerCSRT_create()  # type: ignore[attr-defined]
+        elif t == "KCF":
+            return cv2.TrackerKCF_create()   # type: ignore[attr-defined]
+        else:
+            return cv2.TrackerCSRT_create()  # type: ignore[attr-defined]
 
 
 class VisionTracker:
