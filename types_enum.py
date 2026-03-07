@@ -2,10 +2,10 @@ from enum import Enum
 
 
 class SafetyStatus(Enum):
-    OK      = 0
-    WARNING = 1
-    LAND    = 2
-    HOVER   = 3
+    OK      = "OK"
+    WARNING = "WARNING"
+    HOVER   = "HOVER"
+    LAND    = "LAND"
 
 
 class TrackerState(Enum):
