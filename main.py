@@ -403,7 +403,9 @@ class InterceptorApp:
         """Отправить кадр в MJPEG и GStreamer потоки."""
         global LATEST_JPEG
         # Масштабируем для стрима (экономия CPU + Wi-Fi)
-        sf = cv2.resize(frame, (STREAM_WIDTH, STREAM_HEIGHT))
+        # frame.copy() защищает от гонки с VideoStream reader потоком,
+        # который может перезаписать буфер кадра через cap.read()
+        sf = cv2.resize(frame.copy(), (STREAM_WIDTH, STREAM_HEIGHT))
         ok, jpeg = cv2.imencode(
             '.jpg', sf, [int(cv2.IMWRITE_JPEG_QUALITY), STREAM_QUALITY])
         if ok:

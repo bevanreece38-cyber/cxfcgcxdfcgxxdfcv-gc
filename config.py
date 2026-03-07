@@ -54,7 +54,11 @@ ATTACK_CHANNEL_MAX = 2000
 
 # Keepalive: ArduPilot снимает override если >0.5 сек нет пакетов
 # 25 Гц = запас x8 от требуемого минимума 3 Гц
-KEEPALIVE_HZ = 25
+KEEPALIVE_HZ       = 25   # фактическая частота keepalive потока ControlManager
+MIN_RC_UPDATE_RATE = 25   # минимальная допустимая частота обновления RC override (Гц)
+# KEEPALIVE_HZ — частота keepalive петли в ControlManager
+# MIN_RC_UPDATE_RATE — нижняя граница для внешних компонентов / диагностики
+# Оба = 25 Гц: ControlManager гарантированно выдерживает минимальную частоту
 
 # --- Dead reckoning ---
 # 89 м/с * 0.4 сек = 35 м — допустимо для перехвата
