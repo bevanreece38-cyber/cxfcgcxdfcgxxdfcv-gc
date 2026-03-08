@@ -11,19 +11,27 @@ from types_enum import SafetyStatus
 
 logger = logging.getLogger(__name__)
 
+# Интервал подавления спама для HEARTBEAT LOST в тест-режиме (сек)
+_HEARTBEAT_LOG_INTERVAL = 5.0
+
 
 class SafetyManager:
     def __init__(self, mav_handler):
-        self.mav_handler     = mav_handler
-        self.last_action     = SafetyStatus.OK
-        self.last_action_time = 0.0
+        self.mav_handler          = mav_handler
+        self.last_action          = SafetyStatus.OK
+        self.last_action_time     = 0.0
+        self._last_hb_log_time    = 0.0   # последний раз когда логировали HB LOST
 
     def check(self, state, heartbeat_age: float) -> SafetyStatus:
         if heartbeat_age > HEARTBEAT_TIMEOUT:
             if not state.is_armed or NO_FC_TEST_MODE:
-                logger.warning(
-                    f"HEARTBEAT LOST ({heartbeat_age:.1f}s) — not armed / test mode"
-                )
+                # Спам-защита: логируем не чаще чем раз в _HEARTBEAT_LOG_INTERVAL сек
+                now = time.monotonic()
+                if now - self._last_hb_log_time >= _HEARTBEAT_LOG_INTERVAL:
+                    logger.warning(
+                        f"HEARTBEAT LOST ({heartbeat_age:.1f}s) — not armed / test mode"
+                    )
+                    self._last_hb_log_time = now
                 return SafetyStatus.WARNING
             logger.critical(f"HEARTBEAT LOST ({heartbeat_age:.1f}s) → LAND")
             return SafetyStatus.LAND
