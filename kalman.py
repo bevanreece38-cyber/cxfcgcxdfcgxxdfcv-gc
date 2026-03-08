@@ -82,7 +82,7 @@ class KalmanTargetTracker:
     def predict_only(self):
         """Возвращает (x, y) прогнозную позицию."""
         self._ensure_predict()
-        return (float(self.kf.statePost[0][0]), float(self.kf.statePost[1][0]))
+        return (float(self.kf.statePost[0, 0]), float(self.kf.statePost[1, 0]))
 
     def predict_with_velocity(self):
         """
@@ -92,26 +92,8 @@ class KalmanTargetTracker:
         self._ensure_predict()
         s = self.kf.statePost
         return (
-            float(s[0][0]), float(s[1][0]),
-            self._ema_vx, self._ema_vy,
-        )
-
-    def predict_with_acceleration(self):
-        """
-        Возвращает (x, y, vx, vy, ax, ay).
-        Для кинематического прогноза: pos + vel*t + 0.5*accel*t²
-        Ускорение доступно только после ≥ 2 вызовов update().
-        ax, ay в пикселях/кадр².
-
-        Паттерн PixEagle MotionPredictor.predict_bbox(use_acceleration=True):
-          pred_cx = cx + velocity_x * dt + 0.5 * accel_x * dt²
-        """
-        self._ensure_predict()
-        s = self.kf.statePost
-        return (
-            float(s[0][0]), float(s[1][0]),
-            self._ema_vx, self._ema_vy,
-            self._ema_ax, self._ema_ay,
+            float(s[0, 0]), float(s[1, 0]),
+            float(s[2, 0]), float(s[3, 0]),
         )
 
     def update(self, measurement):
@@ -122,32 +104,7 @@ class KalmanTargetTracker:
         )
         self.kf.correct(meas)
         self._predicted_this_step = False
-
-        # Получаем raw-скорость из Kalman и применяем EMA
-        raw_vx = float(self.kf.statePost[2][0])
-        raw_vy = float(self.kf.statePost[3][0])
-
-        prev_ema_vx = self._ema_vx
-        prev_ema_vy = self._ema_vy
-
-        # EMA velocity smoothing (PixEagle: alpha=0.7)
-        self._ema_vx = _VEL_EMA_ALPHA * raw_vx + (1.0 - _VEL_EMA_ALPHA) * self._ema_vx
-        self._ema_vy = _VEL_EMA_ALPHA * raw_vy + (1.0 - _VEL_EMA_ALPHA) * self._ema_vy
-
-        self._update_count += 1
-
-        # EMA acceleration smoothing (нужно ≥ 2 обновлений)
-        if self._update_count >= 2:
-            inst_ax = self._ema_vx - prev_ema_vx   # px/frame² (ускорение за один кадровый интервал)
-            inst_ay = self._ema_vy - prev_ema_vy
-            # Клампируем для защиты от выброса
-            inst_ax = float(np.clip(inst_ax, -_MAX_ACCEL_PF2, _MAX_ACCEL_PF2))
-            inst_ay = float(np.clip(inst_ay, -_MAX_ACCEL_PF2, _MAX_ACCEL_PF2))
-            # EMA acceleration smoothing (PixEagle: alpha=0.5 — консервативнее)
-            self._ema_ax = _ACC_EMA_ALPHA * inst_ax + (1.0 - _ACC_EMA_ALPHA) * self._ema_ax
-            self._ema_ay = _ACC_EMA_ALPHA * inst_ay + (1.0 - _ACC_EMA_ALPHA) * self._ema_ay
-
-        return (float(self.kf.statePost[0][0]), float(self.kf.statePost[1][0]))
+        return (float(self.kf.statePost[0, 0]), float(self.kf.statePost[1, 0]))
 
     def begin_step(self):
         """Сбросить флаг предсказания — вызывать в начале каждого кадра."""

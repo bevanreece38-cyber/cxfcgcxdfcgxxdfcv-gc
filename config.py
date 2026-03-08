@@ -45,9 +45,13 @@ RC_MID     = 1500   # нейтральное положение стика
 # 0   = ArduPilot применяет минимальный PWM (опасно, дрон упадёт!)
 # 65535 = ArduPilot читает этот канал с ELRS пульта оператора (passthrough)
 RC_RELEASE = 65535
+RC_PASSTHROUGH = RC_RELEASE   # алиас для совместимости со старыми модулями
 
 RC_SAFE_MIN = 1100
 RC_SAFE_MAX = 1900
+
+# Ограничение скорости изменения RC за один кадр (плавность без рывков)
+MAX_RC_DELTA_PER_FRAME = 50
 
 # Throttle в AltHold: 1500 = hover
 RC_THROTTLE_MIN      = 1350  # мягкое снижение
