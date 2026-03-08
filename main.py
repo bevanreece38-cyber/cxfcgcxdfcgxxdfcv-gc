@@ -9,21 +9,23 @@ Interceptor System — Radxa Rock 5B + SpeedyBee F405 + ArduPilot
 
 Логика:
   CH10 OFF: AltHold, оператор управляет пультом
-            YOLO детекция → зелёные прямоугольники на видео для оператора
+            YOLO детекция каждый кадр → зелёные рамки для оператора
   CH10 ON:  take_control() → TrackerEngine.engage()
             Kalman predictive lead → PID yaw+throttle → pitch рампа → удар
-            Потеря цели → release_control() (все каналы = 65535 passthrough)
-  CH10 OFF: release_control() → управление возвращается ELRS пульту
+            Потеря цели → release_control()
+  CH10 OFF: release_control() → CH1-8 отправляем 0 (мгновенный сброс override)
   SAFETY:   release_control() + MAV_CMD_NAV_LAND
 
-ИСПРАВЛЕНО:
-  - RC_RELEASE = 65535 (passthrough), НЕ 0
-  - TrackerEngine.step(yolo_outputs, frame) — правильный порядок аргументов
-  - Плавная рампа throttle (нет рывков при захвате)
+КЛЮЧЕВЫЕ ДЕТАЛИ:
+  - RC_RELEASE = 65535 используется в keepalive (UINT16_MAX = «ignore field»)
+  - release_control() шлёт 0 для CH1-8 → ArduPilot МГНОВЕННО возвращает
+    управление ELRS пульту (без ожидания RC_OVERRIDE_TIME таймаута)
+  - YOLO каждые YOLO_EVERY_N_FRAMES кадров в атаке; каждый кадр в пассиве
 """
 
 import cv2
 import numpy as np
+import queue
 import time
 import sys
 import signal
@@ -43,7 +45,7 @@ from config import (
     GSTREAMER_ENABLED, GSTREAMER_HOST, GSTREAMER_PORT,
     GSTREAMER_WIDTH, GSTREAMER_HEIGHT, GSTREAMER_FPS,
     GSTREAMER_BITRATE, GSTREAMER_ENABLE_HW,
-    RC_RELEASE,
+    RC_RELEASE, YOLO_EVERY_N_FRAMES,
 )
 from types_enum import SafetyStatus, TrackerState
 from utils import setup_logger
@@ -66,10 +68,52 @@ logger = setup_logger(__name__)
 MAX_MAVLINK_MSGS_PER_TICK = 50
 
 # ========================
-#  MJPEG СТРИМИНГ
+#  MJPEG СТРИМИНГ — НУЛЕВАЯ ЗАДЕРЖКА
 # ========================
+# Архитектура:
+#   1. Основной RC-цикл → resize → _RAW_FRAME_Q (maxsize=1, drop old)
+#   2. _encode_worker (фоновый поток) → imencode → LATEST_JPEG + notify _STREAM_COND
+#   3. StreamHandler (по потоку на клиента) → wait_for(_STREAM_COND) → send немедленно
+#
+# Результат:
+#   - RC-цикл освобождён от imencode (~4 мс)
+#   - StreamHandler не имеет sleep → кадр уходит клиенту сразу после кодирования
+#   - GStreamer appsink: max-buffers=1 sync=false (нет буферизации в драйвере)
+
 LATEST_JPEG: Optional[bytes] = None
-LATEST_JPEG_LOCK = threading.Lock()
+_STREAM_COND  = threading.Condition()          # будит StreamHandler-ы при новом JPEG
+_RAW_FRAME_Q: queue.Queue = queue.Queue(maxsize=1)  # BGR → encode thread
+
+
+def _encode_worker():
+    """
+    Фоновый поток JPEG-кодирования.
+    Берёт из _RAW_FRAME_Q (уже масштабированный кадр), кодирует в JPEG,
+    кладёт в LATEST_JPEG и будит все ждущие StreamHandler-ы.
+    Работает параллельно с основным RC-циклом.
+    """
+    global LATEST_JPEG
+    while True:
+        try:
+            try:
+                frame = _RAW_FRAME_Q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            ok, buf = cv2.imencode(
+                '.jpg', frame,
+                [int(cv2.IMWRITE_JPEG_QUALITY), STREAM_QUALITY],
+            )
+            if ok:
+                with _STREAM_COND:
+                    LATEST_JPEG = buf.tobytes()
+                    _STREAM_COND.notify_all()  # немедленно будим все StreamHandler-ы
+        except Exception as e:
+            logger.debug(f"_encode_worker: {e}")
+
+
+# Запускаем поток на уровне модуля — активен сразу при импорте main.
+# В InterceptorApp.__init__ повторный старт не нужен.
+threading.Thread(target=_encode_worker, name="jpeg-encode", daemon=True).start()
 
 
 class StreamHandler(BaseHTTPRequestHandler):
@@ -84,22 +128,28 @@ class StreamHandler(BaseHTTPRequestHandler):
             self.send_header('Cache-Control', 'no-cache')
             self.send_header('Connection', 'keep-alive')
             self.end_headers()
+            last_sent_jpeg = None  # последний отправленный JPEG (identity check)
             while True:
                 try:
-                    with LATEST_JPEG_LOCK:
+                    with _STREAM_COND:
+                        # Ждём НОВЫЙ кадр (отличный по identity от last_sent_jpeg).
+                        # wait_for освобождает _STREAM_COND пока ждёт — нет блокировки.
+                        # timeout=0.5 — keepalive при отсутствии кадров.
+                        if not _STREAM_COND.wait_for(
+                            lambda: LATEST_JPEG is not None and LATEST_JPEG is not last_sent_jpeg,
+                            timeout=0.5,
+                        ):
+                            continue   # timeout, проверяем снова
                         jpeg = LATEST_JPEG
-                    if jpeg is not None:
-                        self.wfile.write(b'--frame\r\n')
-                        self.wfile.write(b'Content-Type: image/jpeg\r\n')
-                        self.wfile.write(
-                            f'Content-Length: {len(jpeg)}\r\n'.encode())
-                        self.wfile.write(b'\r\n')
-                        self.wfile.write(jpeg)
-                        self.wfile.write(b'\r\n')
-                    else:
-                        time.sleep(0.05)
-                        continue
-                    time.sleep(1.0 / MAX_FPS)
+                    # Обновляем маркер ПОСЛЕ выхода из блока with (вне lock)
+                    last_sent_jpeg = jpeg
+                    self.wfile.write(b'--frame\r\n')
+                    self.wfile.write(b'Content-Type: image/jpeg\r\n')
+                    self.wfile.write(
+                        f'Content-Length: {len(jpeg)}\r\n'.encode())
+                    self.wfile.write(b'\r\n')
+                    self.wfile.write(jpeg)
+                    self.wfile.write(b'\r\n')
                 except (BrokenPipeError, ConnectionResetError):
                     break
                 except Exception:
@@ -141,8 +191,16 @@ class InterceptorApp:
         # PixEagle-стиль: трекинг (YOLO + CSRT + Kalman + PID)
         self.tracker = TrackerEngine()
 
-        # NPU (RK3588 — все 3 ядра)
-        self.npu = NPUHandler(MODEL_PATH)
+        # NPU (RK3588 — все 3 ядра).
+        # Graceful degradation: без YOLO дрон работает только с CSRT (Kalman dead reckoning).
+        try:
+            self.npu = NPUHandler(MODEL_PATH)
+        except Exception as e:
+            logger.critical(
+                f"NPU недоступен ({e}). YOLO детекция отключена. "
+                f"Только CSRT трекинг (требует ручную наводку оператором)."
+            )
+            self.npu = None
 
         # Видеозахват (GStreamer MJPEG pipeline, низкая задержка)
         logger.info("Starting video capture (GStreamer MJPEG)...")
@@ -174,6 +232,9 @@ class InterceptorApp:
 
         # Последний результат тр��кера (для CSV лога)
         self._last_result: TrackResult = _idle_result()
+
+        # Счётчик кадров для троттлинга YOLO (NPU тяжёлый — не каждый кадр)
+        self._yolo_frame_idx: int = 0
 
         # MJPEG HTTP сервер (браузер / FPV монитор)
         self.server = ThreadedHTTPServer(('0.0.0.0', STREAM_PORT), StreamHandler)
@@ -218,7 +279,7 @@ class InterceptorApp:
                     if self.ctrl.is_controlling:
                         logger.critical("SAFETY → принудительный release_control()")
                         self.tracker.disengage()
-                        self.ctrl.release_control()  # все каналы = 65535 passthrough
+                        self.ctrl.release_control()  # CH1-8 → 0 (мгновенный сброс override)
                     self.safety.execute_safety_action(safety_status, self.ctrl)
                     self._last_result = _idle_result()
                     self._push_frame(frame, "SAFETY", (0, 0, 255))
@@ -238,8 +299,13 @@ class InterceptorApp:
                     self._limit_fps(t0)
                     continue  # пропускаем inference и управление, но видео показывается
 
-                # 4. NPU YOLO инференс (RK3588, ~15 мс)
-                outputs_pp = self._run_inference(frame)
+                # 4. NPU YOLO инференс с троттлингом
+                # Пассив: каждый кадр → оператор видит все цели в реальном времени
+                # Атака: каждые YOLO_EVERY_N_FRAMES кадров → CSRT заполняет промежутки
+                # Это освобождает ~8 мс NPU на каждом втором кадре в боевом режиме
+                self._yolo_frame_idx = (self._yolo_frame_idx + 1) % YOLO_EVERY_N_FRAMES
+                run_yolo = (not state.attack_switch) or (self._yolo_frame_idx == 0)
+                outputs_pp = self._run_inference(frame) if run_yolo else None
 
                 # 5. Логика CH10 — атака или пассив
                 if state.attack_switch:
@@ -278,6 +344,7 @@ class InterceptorApp:
 
         if result.state in (TrackerState.TRACKING,
                             TrackerState.DEAD_RECKON,
+                            TrackerState.REACQUIRE,
                             TrackerState.STRIKING):
             # Отправляем RC значения через ControlManager
             # rc_roll = RC_RELEASE = 65535 → Roll управляет оператор
@@ -298,7 +365,7 @@ class InterceptorApp:
             # LOST: цель потеряна → немедленно отдать управление оператору
             logger.warning("Цель LOST → release_control() → оператор")
             self.tracker.disengage()
-            self.ctrl.release_control()  # all channels = 65535 passthrough
+            self.ctrl.release_control()  # CH1-8 → 0 (мгновенный сброс override)
             self._push_frame(frame, "LOST — MANUAL", (0, 255, 255))
 
     # ================================================================
@@ -309,7 +376,7 @@ class InterceptorApp:
         if self.ctrl.is_controlling:
             logger.info("CH10 OFF → release_control() → ELRS пульт")
             self.tracker.disengage()
-            self.ctrl.release_control()  # все каналы = 65535 passthrough
+            self.ctrl.release_control()  # CH1-8 → 0 (мгновенный сброс override)
 
         self._last_result = _idle_result()
 
@@ -347,19 +414,20 @@ class InterceptorApp:
             TrackerState.TRACKING:    (0, 0, 255),
             TrackerState.STRIKING:    (0, 0, 255),
             TrackerState.DEAD_RECKON: (0, 255, 255),
+            TrackerState.REACQUIRE:   (0, 165, 255),   # оранжевый
         }.get(r.state, (255, 255, 0))
 
-        # Текущая позиция цели (кружок)
-        fill = -1 if r.state == TrackerState.STRIKING else 2
-        cv2.circle(frame, (tx, ty), 14, color, fill)
-        cv2.rectangle(frame, (tx - 22, ty - 22), (tx + 22, ty + 22), color, 1)
+        # Текущая позиция цели (рисуем только если координаты валидны)
+        if r.target_x >= 0 and r.target_y >= 0:
+            fill = -1 if r.state == TrackerState.STRIKING else 2
+            cv2.circle(frame, (tx, ty), 14, color, fill)
+            cv2.rectangle(frame, (tx - 22, ty - 22), (tx + 22, ty + 22), color, 1)
 
-        # Точка упреждения (крестик) — куда наводимся
-        cv2.drawMarker(frame, (lx, ly), (255, 100, 0),
-                       cv2.MARKER_CROSS, 20, 2)
-
-        # Линия от центра к точке упреждения
-        cv2.line(frame, (cx, cy), (lx, ly), (255, 100, 0), 1)
+            # Точка упреждения и линия к ней (только при валидных координатах)
+            if r.lead_x >= 0 and r.lead_y >= 0:
+                cv2.drawMarker(frame, (lx, ly), (255, 100, 0),
+                               cv2.MARKER_CROSS, 20, 2)
+                cv2.line(frame, (cx, cy), (lx, ly), (255, 100, 0), 1)
 
         # Состояние
         cv2.putText(frame, r.state.value, (10, 30),
@@ -394,7 +462,11 @@ class InterceptorApp:
     #  ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ
     # ================================================================
     def _run_inference(self, frame: np.ndarray):
-        """NPU YOLO инференс. Возвращает post_process() результат или None."""
+        """NPU YOLO инференс. Возвращает post_process() результат или None.
+        Возвращает None если NPU не инициализирован (graceful degradation).
+        """
+        if self.npu is None:
+            return None   # NPU недоступен — CSRT трекинг без YOLO
         img = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         raw = self.npu.inference(rgb)
@@ -414,19 +486,30 @@ class InterceptorApp:
         self._push_frame_raw(frame)
 
     def _push_frame_raw(self, frame: np.ndarray):
-        """Отправить кадр в MJPEG и GStreamer потоки."""
-        global LATEST_JPEG
-        # Масштабируем для стрима (экономия CPU + Wi-Fi)
-        # frame.copy() защищает от гонки с VideoStream reader потоком,
-        # который может перезаписать буфер кадра через cap.read()
-        sf = cv2.resize(frame.copy(), (STREAM_WIDTH, STREAM_HEIGHT))
-        ok, jpeg = cv2.imencode(
-            '.jpg', sf, [int(cv2.IMWRITE_JPEG_QUALITY), STREAM_QUALITY])
-        if ok:
-            with LATEST_JPEG_LOCK:
-                LATEST_JPEG = jpeg.tobytes()
+        """
+        Отправить кадр в MJPEG и GStreamer потоки.
 
-        # H.264 RTP для QGroundControl / VLC
+        JPEG кодирование вынесено в _encode_worker (фоновый поток):
+          - RC-цикл НЕ блокируется на imencode (~4 мс экономии)
+          - Кадр уходит клиенту немедленно после кодирования (нет sleep)
+        cv2.resize создаёт новый массив → безопасно для многопоточности.
+        """
+        # Масштабируем до размера стрима (один раз для обоих выходов)
+        sf = cv2.resize(frame, (STREAM_WIDTH, STREAM_HEIGHT))
+
+        # Помещаем в очередь encode-потока (drop old при переполнении).
+        # Т.к. только главный цикл пишет в очередь, после get_nowait()
+        # очередь гарантированно пуста → второй put_nowait не бросит Full.
+        try:
+            _RAW_FRAME_Q.put_nowait(sf)
+        except queue.Full:
+            try:
+                _RAW_FRAME_Q.get_nowait()   # выбросить устаревший кадр
+            except queue.Empty:
+                pass  # encode-поток уже взял его — очередь и так пуста
+            _RAW_FRAME_Q.put_nowait(sf)     # теперь очередь точно пуста
+
+        # H.264 RTP для QGroundControl / VLC (encode в фоновом потоке GStreamer)
         if self.gst_output and self.gst_output.is_active:
             self.gst_output.send_frame(sf)
 
@@ -470,10 +553,11 @@ class InterceptorApp:
         if self.gst_output:
             self.gst_output.stop()
         self.mav.release()
-        try:
-            self.npu.release()
-        except Exception:
-            pass
+        if self.npu is not None:
+            try:
+                self.npu.release()
+            except Exception:
+                pass
         self.flight_log.close()
         try:
             self.server.server_close()

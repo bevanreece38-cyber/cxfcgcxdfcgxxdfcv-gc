@@ -100,8 +100,10 @@ class VideoStream:
             pipe1 = (
                 f"v4l2src device={self.device_path} io-mode=2 "
                 f"! image/jpeg,width={self.width},height={self.height},framerate={self.fps}/1 "
-                f"! jpegdec ! videoconvert ! video/x-raw,format=BGR "
-                f"! appsink name=sink emit-signals=true sync=false drop=true max-buffers=1"
+                f"! jpegdec "
+                f"! videoconvert "
+                f"! video/x-raw,format=BGR "
+                f"! appsink drop=true max-buffers=1 sync=false"
             )
             try:
                 cap = cv2.VideoCapture(pipe1, cv2.CAP_GSTREAMER)
@@ -113,10 +115,11 @@ class VideoStream:
             # 2. GStreamer без io-mode (fallback для некоторых камер)
             pipe2 = (
                 f"v4l2src device={self.device_path} "
-                f"! image/jpeg,width={self.width},height={self.height},framerate={self.fps}/1 "
-                f"! queue leaky=downstream max-size-buffers=1 "
-                f"! jpegdec ! videoconvert ! video/x-raw,format=BGR "
-                f"! appsink sync=false drop=true max-buffers=1"
+                f"! video/x-raw,format=YUY2,width={self.width},"
+                f"height={self.height},framerate={self.fps}/1 "
+                f"! videoconvert "
+                f"! video/x-raw,format=BGR "
+                f"! appsink drop=true max-buffers=1 sync=false"
             )
             try:
                 cap = cv2.VideoCapture(pipe2, cv2.CAP_GSTREAMER)
@@ -130,6 +133,15 @@ class VideoStream:
         # 3. OpenCV CAP_V4L2 с MJPG + минимальный буфер
         try:
             cap = cv2.VideoCapture(self.src, cv2.CAP_V4L2)
+            # Минимальный внутренний буфер V4L2 — всегда читаем последний кадр.
+            # По умолчанию OpenCV держит 4 кадра → задержка до 133 мс.
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            cap.set(cv2.CAP_PROP_FPS,          self.fps)
+            if self.pixel_format.upper() == "MJPEG":
+                cap.set(cv2.CAP_PROP_FOURCC,
+                        cv2.VideoWriter_fourcc(*'MJPG'))
             if cap.isOpened():
                 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.width)
