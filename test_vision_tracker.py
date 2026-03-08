@@ -85,11 +85,24 @@ def test_csrt_tracks_after_yolo():
     # Первый кадр: YOLO детекция
     result1 = vt.step(frame, _det(320, 240))
     assert result1 is not None
-    # Второй кадр: без YOLO — CSRT должен найти цель
+    # Второй кадр: без YOLO — CSRT или dead reckoning должны дать результат
     result2 = vt.step(frame, None)
-    # На одном и том же кадре CSRT должен дать результат
-    # (может вернуть None если CSRT не смог инициализироваться на черном кадре)
-    # Для textured_frame должен работать
+    # На текстурированном кадре CSRT или Kalman dead reckoning должен дать результат
+    assert result2 is not None, (
+        "CSRT / dead reckoning не смог продолжить трекинг после YOLO детекции"
+    )
+    cx2, cy2, conf2, bbox2 = result2
+    # CSRT на том же кадре: центр должен быть близко к исходной детекции
+    MAX_CSRT_DEVIATION = 80
+    assert abs(cx2 - 320) < MAX_CSRT_DEVIATION, (
+        f"cx2={cx2:.1f} слишком далеко от 320 (допуск {MAX_CSRT_DEVIATION}px)"
+    )
+    assert abs(cy2 - 240) < MAX_CSRT_DEVIATION, (
+        f"cy2={cy2:.1f} слишком далеко от 240 (допуск {MAX_CSRT_DEVIATION}px)"
+    )
+    # CSRT и dead reckoning возвращают conf=0.0 (confidence только от YOLO)
+    assert conf2 >= 0, f"conf2={conf2} не должен быть отрицательным"
+    assert bbox2 is not None, "bbox2 не должен быть None"
 
 
 def test_step_signature_frame_first():
