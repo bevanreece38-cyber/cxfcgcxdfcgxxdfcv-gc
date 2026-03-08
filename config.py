@@ -140,3 +140,8 @@ GSTREAMER_HEIGHT    = 360
 GSTREAMER_FPS       = 25
 GSTREAMER_BITRATE   = 1000       # kbps
 GSTREAMER_ENABLE_HW = True       # mpph264enc Rockchip MPP RK3588
+
+# --- Режим без полётного контроллера (тест с камерой без SpeedyBee) ---
+# True  = SAFETY не блокирует цикл если MAVLink не подключён и дрон не армирован
+# False = боевой режим (SAFETY блокирует при потере heartbeat)
+NO_FC_TEST_MODE = False

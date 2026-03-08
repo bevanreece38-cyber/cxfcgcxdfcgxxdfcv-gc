@@ -107,22 +107,23 @@ class VideoStream:
         fmt = self.pixel_format.upper()
         if fmt == "MJPEG":
             pipeline = (
-                f"v4l2src device={self.device_path} "
-                f"! image/jpeg,width={self.width},height={self.height},framerate={self.fps}/1 "
+                f"v4l2src device={self.device_path} io-mode=2 "
+                f"! image/jpeg,width={self.width},height={self.height},"
+                f"framerate={self.fps}/1,pixel-aspect-ratio=1/1 "
                 f"! jpegdec "
                 f"! videoconvert "
                 f"! video/x-raw,format=BGR "
-                f"! appsink drop=1"
+                f"! appsink drop=true max-buffers=1 sync=false"
             )
         else:
             # YUYV
             pipeline = (
-                f"v4l2src device={self.device_path} "
+                f"v4l2src device={self.device_path} io-mode=2 "
                 f"! video/x-raw,format=YUY2,width={self.width},"
                 f"height={self.height},framerate={self.fps}/1 "
                 f"! videoconvert "
                 f"! video/x-raw,format=BGR "
-                f"! appsink drop=1"
+                f"! appsink drop=true max-buffers=1 sync=false"
             )
         try:
             cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
@@ -138,6 +139,7 @@ class VideoStream:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
             cap.set(cv2.CAP_PROP_FPS,          self.fps)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
             if self.pixel_format.upper() == "MJPEG":
                 cap.set(cv2.CAP_PROP_FOURCC,
                         cv2.VideoWriter_fourcc(*'MJPG'))
