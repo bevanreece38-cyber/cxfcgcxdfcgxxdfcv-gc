@@ -21,6 +21,7 @@ Interceptor System — Radxa Rock 5B + SpeedyBee F405 + ArduPilot
   - release_control() шлёт 0 для CH1-8 → ArduPilot МГНОВЕННО возвращает
     управление ELRS пульту (без ожидания RC_OVERRIDE_TIME таймаута)
   - YOLO каждые YOLO_EVERY_N_FRAMES кадров в атаке; каждый кадр в пассиве
+  - WARNING (нет FC) НЕ блокирует видео — YOLO и стриминг работают в полном объёме
 """
 
 import cv2
@@ -230,7 +231,7 @@ class InterceptorApp:
         # Лог полётных данных
         self.flight_log = FlightLogger()
 
-        # Последний результат тр��кера (для CSV лога)
+        # Последний результат трекера (для CSV лога)
         self._last_result: TrackResult = _idle_result()
 
         # Счётчик кадров для троттлинга YOLO (NPU тяжёлый — не каждый кадр)
@@ -286,18 +287,12 @@ class InterceptorApp:
                     self._log(state, safety_status)
                     self._limit_fps(t0)
                     continue
-                elif safety_status == SafetyStatus.WARNING:
-                    # Предупреждение (нет FC или нет heartbeat но не армирован) — показываем видео с меткой
+
+                # WARNING (нет FC / не армирован) — показываем метку на кадре,
+                # НО продолжаем YOLO + стриминг в полном объёме (нет continue!)
+                if safety_status == SafetyStatus.WARNING:
                     cv2.putText(frame, "NO FC / WARNING", (10, 60),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 2)
-                    # НЕ делаем continue — продолжаем показывать видео
-
-                # WARNING (нет FC / не армирован) — показываем видео с меткой, НЕ блокируем
-                if safety_status == SafetyStatus.WARNING:
-                    self._push_frame(frame, "NO FC", (0, 165, 255))  # оранжевый
-                    self._log(state, safety_status)
-                    self._limit_fps(t0)
-                    continue  # пропускаем inference и управление, но видео показывается
 
                 # 4. NPU YOLO инференс с троттлингом
                 # Пассив: каждый кадр → оператор видит все цели в реальном времени
@@ -338,7 +333,6 @@ class InterceptorApp:
             self.tracker.engage()
 
         # PixEagle: один шаг трекинга
-        # ИСПРАВЛЕНО: передаём frame вторым аргументом
         result = self.tracker.step(outputs_pp, frame)
         self._last_result = result
 
@@ -437,7 +431,7 @@ class InterceptorApp:
         bar_w = int(r.ramp_progress * (FRAME_WIDTH - 20))
         cv2.rectangle(frame, (10, FRAME_HEIGHT - 18),
                       (10 + bar_w, FRAME_HEIGHT - 8), (0, 0, 255), -1)
-        cv2.putText(frame, f"DIVE {r.ramp_progress * 100:.0f}%",
+        cv2.putText(frame, f"DIVE {r.ramp_progress * 100:.0f}%%",
                     (10, FRAME_HEIGHT - 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
@@ -462,11 +456,9 @@ class InterceptorApp:
     #  ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ
     # ================================================================
     def _run_inference(self, frame: np.ndarray):
-        """NPU YOLO инференс. Возвращает post_process() результат или None.
-        Возвращает None если NPU не инициализирован (graceful degradation).
-        """
+        """NPU YOLO инференс. Возвращает post_process() результат или None."""
         if self.npu is None:
-            return None   # NPU недоступен — CSRT трекинг без YOLO
+            return None
         img = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         raw = self.npu.inference(rgb)
@@ -486,30 +478,25 @@ class InterceptorApp:
         self._push_frame_raw(frame)
 
     def _push_frame_raw(self, frame: np.ndarray):
-        """
-        Отправить кадр в MJPEG и GStreamer потоки.
+        """Отправить кадр в MJPEG и GStreamer потоки."""
+        # Масштабируем для стрима (экономия CPU + Wi-Fi)
+        # frame.copy() защищает от гонки с VideoStream reader потоком
+        sf = cv2.resize(frame.copy(), (STREAM_WIDTH, STREAM_HEIGHT))
 
-        JPEG кодирование вынесено в _encode_worker (фоновый поток):
-          - RC-цикл НЕ блокируется на imencode (~4 мс экономии)
-          - Кадр уходит клиенту немедленно после кодирования (нет sleep)
-        cv2.resize создаёт новый массив → безопасно для многопоточности.
-        """
-        # Масштабируем до размера стрима (один раз для обоих выходов)
-        sf = cv2.resize(frame, (STREAM_WIDTH, STREAM_HEIGHT))
-
-        # Помещаем в очередь encode-потока (drop old при переполнении).
-        # Т.к. только главный цикл пишет в очередь, после get_nowait()
-        # очередь гарантированно пуста → второй put_nowait не бросит Full.
+        # Кладём в очередь кодировщика (нон-блокирующий — дроп старого кадра)
         try:
             _RAW_FRAME_Q.put_nowait(sf)
         except queue.Full:
             try:
-                _RAW_FRAME_Q.get_nowait()   # выбросить устаревший кадр
+                _RAW_FRAME_Q.get_nowait()
             except queue.Empty:
-                pass  # encode-поток уже взял его — очередь и так пуста
-            _RAW_FRAME_Q.put_nowait(sf)     # теперь очередь точно пуста
+                pass
+            try:
+                _RAW_FRAME_Q.put_nowait(sf)
+            except queue.Full:
+                pass
 
-        # H.264 RTP для QGroundControl / VLC (encode в фоновом потоке GStreamer)
+        # H.264 RTP для QGroundControl / VLC
         if self.gst_output and self.gst_output.is_active:
             self.gst_output.send_frame(sf)
 
@@ -553,11 +540,11 @@ class InterceptorApp:
         if self.gst_output:
             self.gst_output.stop()
         self.mav.release()
-        if self.npu is not None:
-            try:
+        try:
+            if self.npu:
                 self.npu.release()
-            except Exception:
-                pass
+        except Exception:
+            pass
         self.flight_log.close()
         try:
             self.server.server_close()
