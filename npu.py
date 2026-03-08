@@ -1,6 +1,5 @@
 import numpy as np
 import logging
-from rknnlite.api import RKNNLite
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -11,6 +10,9 @@ class NPUHandler:
     YOLO инференс на NPU Rockchip RK3588 (Radxa Rock 5B).
     Использует все 3 ядра NPU (NPU_CORE_0_1_2) для максимальной скорости.
     В связке с CSRT трекером даёт 15 FPS детекций + 30 FPS трекинга.
+
+    Graceful degradation: если rknnlite не установлен, NPU недоступен —
+    возвращает None на каждый вызов inference().
     """
 
     def __init__(self, model_path: str):
@@ -19,6 +21,7 @@ class NPUHandler:
         self.inf_count    = 0
         self.error_count  = 0
         try:
+            from rknnlite.api import RKNNLite
             self.rknn = RKNNLite()
             if self.rknn.load_rknn(model_path) != 0:
                 raise RuntimeError("load_rknn failed")
