@@ -1,19 +1,13 @@
 """
-VideoStream — захват видео с цифровой камеры (Radxa Rock 5B).
+VideoStream — DroneEngage-стиль захват видео.
 
-Поддерживаемые режимы:
-  1. GStreamer pipeline (VIDEO_USE_GSTREAMER=True):
-       v4l2src → videoscale → MJPEG декодирование → BGR
-       Рекомендуется для низкой задержки на RK3588.
+Принципы DroneEngage:
+  - UVC MJPEG: v4l2src io-mode=2 (mmap) → jpegdec → BGR appsink
+  - sync=false, drop=true, max-buffers=1 → нулевая задержка
+  - Фоновый поток непрерывно перезаписывает последний кадр
+  - Автовыбор pipeline: GStreamer MJPEG → GStreamer raw → OpenCV V4L2 MJPG → OpenCV fallback
 
-  2. OpenCV VideoCapture (fallback):
-       Прямой захват через V4L2.
-
-Параметры из config.py:
-  VIDEO_SOURCE_INDEX  = 1          (/dev/video1)
-  VIDEO_PIXEL_FORMAT  = "MJPEG"    (или "YUYV")
-  VIDEO_USE_GSTREAMER = True
-  FRAME_WIDTH=640, FRAME_HEIGHT=480, MAX_FPS=30
+https://github.com/DroneEngage/droneengage_camera
 """
 
 import cv2
@@ -23,6 +17,12 @@ import time
 from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# Имена pipeline для логирования
+PIPELINE_GST_MJPEG   = "GStreamer UVC MJPEG (io-mode=2, drop=true)"
+PIPELINE_GST_RAW     = "GStreamer RAW fallback"
+PIPELINE_CV_V4L2     = "OpenCV CAP_V4L2 MJPG"
+PIPELINE_CV_FALLBACK = "OpenCV fallback"
 
 
 class VideoStream:
@@ -53,17 +53,19 @@ class VideoStream:
         self.pixel_format  = pixel_format
         self.device_path   = device_path
 
-        self._cap:    Optional[cv2.VideoCapture] = None
-        self._frame:  Optional[object]            = None
-        self._ret:    bool                        = False
-        self._lock    = threading.Lock()
-        self._stop    = threading.Event()
-        self._thread: Optional[threading.Thread] = None
+        self._cap:           Optional[cv2.VideoCapture] = None
+        self._pipeline_name: str                        = ""
+        self._frame:         Optional[object]           = None
+        self._ret:           bool                       = False
+        self._lock           = threading.Lock()
+        self._stop           = threading.Event()
+        self._thread:        Optional[threading.Thread] = None
 
     def start(self) -> 'VideoStream':
-        self._cap = self._open_capture()
+        self._cap, self._pipeline_name = self._open_capture()
+        logger.info(f"VideoStream: {self._pipeline_name} → {self.device_path}")
         if self._cap is None or not self._cap.isOpened():
-            logger.error("VideoStream: не удалось открыть камеру!")
+            logger.error("VideoStream: камера не открылась!")
         self._thread = threading.Thread(
             target=self._reader_loop,
             name="video-capture",
@@ -71,7 +73,7 @@ class VideoStream:
         )
         self._thread.start()
         # Дать потоку захватить первый кадр
-        time.sleep(0.2)
+        time.sleep(0.3)
         return self
 
     def read(self) -> Tuple[bool, Optional[object]]:
@@ -91,50 +93,49 @@ class VideoStream:
     #  Внутренние
     # ------------------------------------------------------------------
 
-    def _open_capture(self) -> Optional[cv2.VideoCapture]:
-        """Попытаться открыть через GStreamer, потом fallback OpenCV."""
+    def _open_capture(self) -> Tuple[Optional[cv2.VideoCapture], str]:
+        """Попробовать pipelines по приоритету DroneEngage."""
         if self.use_gstreamer:
-            cap = self._try_gstreamer()
-            if cap is not None and cap.isOpened():
-                logger.info("VideoStream: GStreamer pipeline OK")
-                return cap
-            logger.warning("VideoStream: GStreamer failed → OpenCV fallback")
-
-        return self._try_opencv()
-
-    def _try_gstreamer(self) -> Optional[cv2.VideoCapture]:
-        """GStreamer pipeline для RK3588."""
-        fmt = self.pixel_format.upper()
-        if fmt == "MJPEG":
-            pipeline = (
-                f"v4l2src device={self.device_path} "
+            # 1. GStreamer UVC MJPEG (DroneEngage primary pipeline)
+            pipe1 = (
+                f"v4l2src device={self.device_path} io-mode=2 "
                 f"! image/jpeg,width={self.width},height={self.height},framerate={self.fps}/1 "
                 f"! jpegdec "
                 f"! videoconvert "
                 f"! video/x-raw,format=BGR "
-                f"! appsink drop=1"
+                f"! appsink drop=true max-buffers=1 sync=false"
             )
-        else:
-            # YUYV
-            pipeline = (
+            try:
+                cap = cv2.VideoCapture(pipe1, cv2.CAP_GSTREAMER)
+                if cap.isOpened():
+                    return cap, PIPELINE_GST_MJPEG
+            except Exception as e:
+                logger.warning(f"GStreamer MJPEG pipeline error: {e}")
+
+            # 2. GStreamer без io-mode (fallback для некоторых камер)
+            pipe2 = (
                 f"v4l2src device={self.device_path} "
                 f"! video/x-raw,format=YUY2,width={self.width},"
                 f"height={self.height},framerate={self.fps}/1 "
                 f"! videoconvert "
                 f"! video/x-raw,format=BGR "
-                f"! appsink drop=1"
+                f"! appsink drop=true max-buffers=1 sync=false"
             )
-        try:
-            cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
-            return cap if cap.isOpened() else None
-        except Exception as e:
-            logger.warning(f"GStreamer pipeline error: {e}")
-            return None
+            try:
+                cap = cv2.VideoCapture(pipe2, cv2.CAP_GSTREAMER)
+                if cap.isOpened():
+                    return cap, PIPELINE_GST_RAW
+            except Exception as e:
+                logger.warning(f"GStreamer RAW pipeline error: {e}")
 
-    def _try_opencv(self) -> Optional[cv2.VideoCapture]:
-        """Прямой захват через V4L2."""
+            logger.warning("VideoStream: GStreamer failed → OpenCV fallback")
+
+        # 3. OpenCV CAP_V4L2 с MJPG + минимальный буфер
         try:
             cap = cv2.VideoCapture(self.src, cv2.CAP_V4L2)
+            # Минимальный внутренний буфер V4L2 — всегда читаем последний кадр.
+            # По умолчанию OpenCV держит 4 кадра → задержка до 133 мс.
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
             cap.set(cv2.CAP_PROP_FPS,          self.fps)
@@ -142,21 +143,35 @@ class VideoStream:
                 cap.set(cv2.CAP_PROP_FOURCC,
                         cv2.VideoWriter_fourcc(*'MJPG'))
             if cap.isOpened():
-                logger.info("VideoStream: OpenCV V4L2 OK")
-                return cap
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+                cap.set(cv2.CAP_PROP_FPS,          self.fps)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)  # КРИТИЧНО: минимум задержки
+                return cap, PIPELINE_CV_V4L2
         except Exception as e:
-            logger.error(f"OpenCV capture error: {e}")
-        return None
+            logger.warning(f"OpenCV CAP_V4L2 error: {e}")
+
+        # 4. Последний fallback
+        cap = cv2.VideoCapture(self.src)
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception as e:
+            logger.warning(f"OpenCV fallback BUFFERSIZE error: {e}")
+        return cap, PIPELINE_CV_FALLBACK
 
     def _reader_loop(self):
-        """Фоновый поток захвата кадров."""
+        """Непрерывно читать последний кадр (DroneEngage стиль)."""
         logger.debug("VideoStream reader started")
         while not self._stop.is_set():
-            if self._cap and self._cap.isOpened():
-                ret, frame = self._cap.read()
+            if self._cap is None or not self._cap.isOpened():
+                time.sleep(0.01)
+                continue
+            ret, frame = self._cap.read()
+            if ret and frame is not None:
                 with self._lock:
                     self._ret   = ret
-                    self._frame = frame
+                    self._frame = frame  # всегда только последний кадр
             else:
-                time.sleep(0.1)
+                time.sleep(0.005)
         logger.debug("VideoStream reader stopped")

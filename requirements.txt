@@ -1,0 +1,5 @@
+pymavlink>=2.4.40
+# opencv-contrib-python включает все модули opencv-python + contrib (CSRT, KCF и др.)
+# НЕ устанавливать opencv-python отдельно — конфликт модуля cv2
+opencv-contrib-python>=4.8.0
+numpy>=1.24.0

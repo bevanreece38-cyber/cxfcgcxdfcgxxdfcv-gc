@@ -51,7 +51,7 @@ class GStreamerOutput:
         self._encoder    = self._detect_encoder(allow_hardware)
         self._pipeline   = self._build_pipeline()
         self._out: Optional[cv2.VideoWriter] = None
-        self._queue: queue.Queue = queue.Queue(maxsize=3)
+        self._queue: queue.Queue = queue.Queue(maxsize=1)  # maxsize=1: всегда отправляем свежий кадр
         self._stop_event = threading.Event()
         self._thread:    Optional[threading.Thread] = None
         self._drops      = 0

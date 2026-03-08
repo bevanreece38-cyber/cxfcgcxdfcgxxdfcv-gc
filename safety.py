@@ -5,7 +5,7 @@ from config import (
     MIN_ALTITUDE, MAX_DESCENT_RATE,
     BATTERY_CRITICAL, BATTERY_LOW,
     TEMP_CRITICAL, TEMP_WARNING,
-    HEARTBEAT_TIMEOUT,
+    HEARTBEAT_TIMEOUT, NO_FC_TEST_MODE,
 )
 from types_enum import SafetyStatus
 
@@ -20,6 +20,11 @@ class SafetyManager:
 
     def check(self, state, heartbeat_age: float) -> SafetyStatus:
         if heartbeat_age > HEARTBEAT_TIMEOUT:
+            if not state.is_armed or NO_FC_TEST_MODE:
+                logger.warning(
+                    f"HEARTBEAT LOST ({heartbeat_age:.1f}s) — not armed / test mode"
+                )
+                return SafetyStatus.WARNING
             logger.critical(f"HEARTBEAT LOST ({heartbeat_age:.1f}s) → LAND")
             return SafetyStatus.LAND
         if not state.is_armed:
