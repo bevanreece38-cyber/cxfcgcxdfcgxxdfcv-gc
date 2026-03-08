@@ -223,6 +223,11 @@ class InterceptorApp:
                     self._log(state, safety_status)
                     self._limit_fps(t0)
                     continue
+                elif safety_status == SafetyStatus.WARNING:
+                    # Предупреждение (нет FC или нет heartbeat но не армирован) — показываем видео с меткой
+                    cv2.putText(frame, "NO FC / WARNING", (10, 60),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 2)
+                    # НЕ делаем continue — продолжаем показывать видео
 
                 # 4. NPU YOLO инференс (RK3588, ~15 мс)
                 outputs_pp = self._run_inference(frame)
