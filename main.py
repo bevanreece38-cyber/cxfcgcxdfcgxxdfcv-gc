@@ -212,6 +212,8 @@ class InterceptorApp:
                 safety_status = self.safety.check(
                     state, self.state_est.heartbeat_age
                 )
+
+                # SAFETY LAND — блокируем цикл
                 if safety_status not in (SafetyStatus.OK, SafetyStatus.WARNING):
                     if self.ctrl.is_controlling:
                         logger.critical("SAFETY → принудительный release_control()")
@@ -228,6 +230,13 @@ class InterceptorApp:
                     cv2.putText(frame, "NO FC / WARNING", (10, 60),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 2)
                     # НЕ делаем continue — продолжаем показывать видео
+
+                # WARNING (нет FC / не армирован) — показываем видео с меткой, НЕ блокируем
+                if safety_status == SafetyStatus.WARNING:
+                    self._push_frame(frame, "NO FC", (0, 165, 255))  # оранжевый
+                    self._log(state, safety_status)
+                    self._limit_fps(t0)
+                    continue  # пропускаем inference и управление, но видео показывается
 
                 # 4. NPU YOLO инференс (RK3588, ~15 мс)
                 outputs_pp = self._run_inference(frame)

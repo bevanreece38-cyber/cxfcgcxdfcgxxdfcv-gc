@@ -20,10 +20,9 @@ class SafetyManager:
 
     def check(self, state, heartbeat_age: float) -> SafetyStatus:
         if heartbeat_age > HEARTBEAT_TIMEOUT:
-            if NO_FC_TEST_MODE or not state.is_armed:
-                # Нет FC или не армирован — предупреждение, но не LAND
+            if not state.is_armed or NO_FC_TEST_MODE:
                 logger.warning(
-                    f"HEARTBEAT LOST ({heartbeat_age:.1f}s) — no FC / not armed, continuing"
+                    f"HEARTBEAT LOST ({heartbeat_age:.1f}s) — not armed / test mode"
                 )
                 return SafetyStatus.WARNING
             logger.critical(f"HEARTBEAT LOST ({heartbeat_age:.1f}s) → LAND")
